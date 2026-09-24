@@ -60,6 +60,11 @@ ACTIVE_LEVELS_EACH_SIDE = env_int("ACTIVE_LEVELS_EACH_SIDE", "1")
 # LONG is placed below best bid, SHORT is placed above best ask.
 ENTRY_OFFSET_PCT = env_decimal("ENTRY_OFFSET_PCT", "0.0001")
 
+# Adaptive entry: while no position is filled, refresh both entry orders around live bid/ask.
+# This prevents old orders from standing far away after the market moves.
+REPRICE_ENTRY_SECONDS = env_float("REPRICE_ENTRY_SECONDS", "10")
+REPRICE_MIN_MOVE_PCT = env_decimal("REPRICE_MIN_MOVE_PCT", "0.00005")  # 0.005%
+
 # Main trading logic.
 # Net est is the main clean-profit trigger.
 TAKE_NET_PROFIT = env_decimal("TAKE_NET_PROFIT", "0.05")
@@ -599,6 +604,10 @@ class OneShotNetGridCycle:
         self.tp_order_placed = False
         self.best_net = Decimal('-999999')
         self.best_exchange_upnl = Decimal('-999999')
+        self.last_reprice_at = 0.0
+        self.entry_revision = 0
+        self.current_long_entry_price = Decimal('0')
+        self.current_short_entry_price = Decimal('0')
 
     def build_levels(self):
         step = (UPPER_PRICE - LOWER_PRICE) / Decimal(GRID_COUNT)
@@ -649,59 +658,143 @@ class OneShotNetGridCycle:
         self.register_order(data, "ENTRY", "SHORT", level_index, price, qty)
         return True
 
-    def start(self) -> bool:
+    def compute_offset_entry_prices(self):
         bid, ask, mid = get_book()
-        if mid <= LOWER_PRICE or mid >= UPPER_PRICE:
-            log(f"🟡 Ціна {mid} поза діапазоном {LOWER_PRICE}-{UPPER_PRICE}")
-            return False
-
         tick = self.filters["tick"]
         offset = ENTRY_OFFSET_PCT
 
-        # Fast offset entry: orders are placed close to the live order book.
-        # Example: offset 0.0001 = 0.01%.
-        # LONG is slightly below bid, SHORT is slightly above ask, so they remain limit orders.
+        # Adaptive offset entry: LONG below best bid, SHORT above best ask.
         long_price = floor_step(bid * (Decimal("1") - offset), tick)
         short_price = ceil_step(ask * (Decimal("1") + offset), tick)
 
-        # Extra protection after rounding: do not let orders cross the book accidentally.
+        # Extra protection after rounding: never cross the book accidentally.
         if long_price >= ask:
             long_price = floor_step(ask - tick, tick)
         if short_price <= bid:
             short_price = ceil_step(bid + tick, tick)
 
+        return bid, ask, mid, long_price, short_price
+
+    def place_offset_entry_pair(self, reason: str = "START", notify: bool = False) -> bool:
+        bid, ask, mid, long_price, short_price = self.compute_offset_entry_prices()
+
+        if mid <= LOWER_PRICE or mid >= UPPER_PRICE:
+            log(f"🟡 Ціна {mid} поза діапазоном {LOWER_PRICE}-{UPPER_PRICE}")
+            return False
+
         if long_price <= 0 or short_price <= 0:
             log("🟡 Не вдалося розрахувати коректні entry-ціни")
             return False
 
-        active_cells = 2
-        max_active_notional = ORDER_NOTIONAL_USDT * Decimal(active_cells)
+        self.entry_revision += 1
+        self.current_long_entry_price = long_price
+        self.current_short_entry_price = short_price
+        self.last_reprice_at = time.monotonic()
+
+        placed_long = 0
+        placed_short = 0
+        try:
+            placed_long = 1 if self.place_long_entry(self.entry_revision * 10, long_price) else 0
+            time.sleep(0.02)
+            placed_short = 1 if self.place_short_entry(self.entry_revision * 10 + 1, short_price) else 0
+        except Exception as error:
+            log(f"⚠️ Не зміг виставити adaptive entry ордери: {error}", telegram=True)
+            return False
+
+        max_active_notional = ORDER_NOTIONAL_USDT * Decimal("2")
+        max_active_margin = max_active_notional / Decimal(LEVERAGE)
+
+        msg = (
+            f"🔁 Adaptive entry {reason} #{self.entry_revision}\n"
+            f"{SYMBOL} bid/ask/mid: {bid} / {ask} / {mid}\n"
+            f"BUY LONG: {long_price}\n"
+            f"SELL SHORT: {short_price}\n"
+            f"Offset: {(ENTRY_OFFSET_PCT * Decimal('100')):.4f}% | Reprice: {REPRICE_ENTRY_SECONDS}s\n"
+            f"Orders: LONG {placed_long} + SHORT {placed_short}\n"
+            f"Notional per entry: {ORDER_NOTIONAL_USDT} USDT | Max active margin ≈ {max_active_margin:.2f} USDT"
+        )
+        log(msg, telegram=notify)
+        return placed_long + placed_short > 0
+
+    def start(self) -> bool:
+        bid, ask, mid, long_price, short_price = self.compute_offset_entry_prices()
+        if mid <= LOWER_PRICE or mid >= UPPER_PRICE:
+            log(f"🟡 Ціна {mid} поза діапазоном {LOWER_PRICE}-{UPPER_PRICE}")
+            return False
+
+        max_active_notional = ORDER_NOTIONAL_USDT * Decimal("2")
         max_active_margin = max_active_notional / Decimal(LEVERAGE)
 
         header = (
-            f"🟢 OFFSET ENTRY CYCLE #{self.cycle_number}\n"
+            f"🟢 ADAPTIVE NEUTRAL CYCLE #{self.cycle_number}\n"
             f"{SYMBOL} bid/ask/mid: {bid} / {ask} / {mid}\n"
             f"Range guard: {LOWER_PRICE} - {UPPER_PRICE}\n"
             f"Entry offset: {(ENTRY_OFFSET_PCT * Decimal('100')):.4f}%\n"
-            f"BUY LONG price: {long_price}\n"
-            f"SELL SHORT price: {short_price}\n"
-            f"Orders: 1 LONG + 1 SHORT\n"
+            f"Reprice entry every: {REPRICE_ENTRY_SECONDS}s | min move: {(REPRICE_MIN_MOVE_PCT * Decimal('100')):.4f}%\n"
+            f"Initial BUY LONG price: {long_price}\n"
+            f"Initial SELL SHORT price: {short_price}\n"
+            f"Orders: 1 LONG + 1 SHORT, then adaptive reprice until fill\n"
             f"Notional per entry: {ORDER_NOTIONAL_USDT} USDT\n"
             f"Max active margin ≈ {max_active_margin:.2f} USDT\n"
-            f"Take Net est: +{TAKE_NET_PROFIT} USDT | Stop Net est: {MAX_CYCLE_LOSS} USDT"
+            f"Take Net est: +{TAKE_NET_PROFIT} USDT | Stop Net est: {MAX_CYCLE_LOSS} USDT\n"
+            f"TP limit: {'on' if USE_TP_LIMIT_ORDER else 'off'} | Hybrid uPnL take: +{TAKE_EXCHANGE_UPNL} with net guard {EXCHANGE_TAKE_MIN_NET}"
         )
         log("\n" + "=" * 68)
         log(header, telegram=True)
         log("=" * 68)
 
-        placed_long = 1 if self.place_long_entry(0, long_price) else 0
-        time.sleep(0.03)
-        placed_short = 1 if self.place_short_entry(1, short_price) else 0
-        time.sleep(0.03)
-
-        log(f"✅ Entry orders: {placed_long + placed_short} (LONG {placed_long} / SHORT {placed_short})")
+        ok = self.place_offset_entry_pair(reason="START", notify=False)
         log(f"💵 Wallet на старті циклу: {self.start_wallet:.4f} USDT")
-        return True
+        return ok
+
+    def should_reprice_entries(self) -> bool:
+        if self.entry_filled:
+            return False
+        if REPRICE_ENTRY_SECONDS <= 0:
+            return False
+        if time.monotonic() - self.last_reprice_at < REPRICE_ENTRY_SECONDS:
+            return False
+
+        try:
+            bid, ask, mid, new_long, new_short = self.compute_offset_entry_prices()
+        except Exception:
+            return True
+
+        # If current entry prices are empty, reprice.
+        if self.current_long_entry_price <= 0 or self.current_short_entry_price <= 0:
+            return True
+
+        long_move = abs(new_long - self.current_long_entry_price) / self.current_long_entry_price
+        short_move = abs(new_short - self.current_short_entry_price) / self.current_short_entry_price
+        return long_move >= REPRICE_MIN_MOVE_PCT or short_move >= REPRICE_MIN_MOVE_PCT
+
+    def reprice_entry_orders_if_needed(self, stats: Optional[Dict[str, Decimal]] = None) -> None:
+        """While flat, cancel stale entry orders and recreate them around live price."""
+        if self.entry_filled:
+            return
+
+        # If there is already a live position, do not reprice; detect it instead.
+        if stats and stats.get("position_amount", Decimal("0")) > 0:
+            self.mark_entry_from_stats(stats)
+            return
+
+        if not self.should_reprice_entries():
+            return
+
+        try:
+            cancel_all_orders()
+            time.sleep(0.05)
+        except Exception as error:
+            log(f"⚠️ Не зміг скасувати старі entry перед reprice: {error}", telegram=True)
+            return
+
+        # Check again after cancel: if an order got filled during cancellation, do not place new entries.
+        fresh_stats = self.estimated_net_pnl()
+        if fresh_stats.get("position_amount", Decimal("0")) > 0:
+            self.mark_entry_from_stats(fresh_stats)
+            return
+
+        self.place_offset_entry_pair(reason="REPRICE", notify=False)
 
     def calc_tp_limit_price(self, side_type: str, entry_price: Decimal, quantity: Decimal) -> Decimal:
         """Return close-limit price that should produce TAKE_NET_PROFIT after estimated taker fees.
@@ -1009,6 +1102,10 @@ def run_cycle(cycle_number: int, filters: Dict[str, Decimal], taker_fee: Decimal
         # Fast entry detection by live position; avoids slow allOrders polling.
         cycle.mark_entry_from_stats(stats)
 
+        # Adaptive neutral mode: while no position is filled, keep entry orders close to live price.
+        if not cycle.entry_filled:
+            cycle.reprice_entry_orders_if_needed(stats)
+
         # If native TP limit or manual close already closed the position, finish cleanly.
         if cycle.entry_filled and stats["position_amount"] <= 0:
             return finish_cycle_already_closed(cycle, cycle_started_at)
@@ -1089,13 +1186,14 @@ def main() -> None:
     require_env()
 
     banner = (
-        f"🤖 {SYMBOL} ONE-SHOT NET EST GRID BOT\n"
+        f"🤖 {SYMBOL} ADAPTIVE NEUTRAL OFFSET BOT v5\n"
         f"Time: {now_utc()}\n"
         f"Base URL: {BASE_URL}\n"
         f"Range: {LOWER_PRICE} - {UPPER_PRICE} | Grid: {GRID_COUNT}\n"
         f"Budget: {MARGIN_BUDGET_USDT} USDT | Leverage: {LEVERAGE}x\n"
         f"Order notional: {ORDER_NOTIONAL_USDT} USDT\n"
         f"Entry offset: {(ENTRY_OFFSET_PCT * Decimal('100')):.4f}% from bid/ask\n"
+        f"Adaptive reprice: every {REPRICE_ENTRY_SECONDS}s, min move {(REPRICE_MIN_MOVE_PCT * Decimal('100')):.4f}%\n"
         f"TAKE Net est: +{TAKE_NET_PROFIT} USDT\n"
         f"TAKE exchange uPnL: +{TAKE_EXCHANGE_UPNL} USDT with Net guard {EXCHANGE_TAKE_MIN_NET}\n"
         f"Native TP limit: {'on' if USE_TP_LIMIT_ORDER else 'off'}\n"
