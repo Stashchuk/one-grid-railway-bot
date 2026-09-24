@@ -6,7 +6,7 @@ import requests
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_CEILING
 from datetime import datetime, timezone
 from urllib.parse import urlencode
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 try:
     from dotenv import load_dotenv
@@ -64,6 +64,21 @@ ENTRY_OFFSET_PCT = env_decimal("ENTRY_OFFSET_PCT", "0.0001")
 # This prevents old orders from standing far away after the market moves.
 REPRICE_ENTRY_SECONDS = env_float("REPRICE_ENTRY_SECONDS", "10")
 REPRICE_MIN_MOVE_PCT = env_decimal("REPRICE_MIN_MOVE_PCT", "0.00005")  # 0.005%
+
+# Smart adaptive layer.
+# The bot keeps a large virtual grid in memory, but places only active orders near live price.
+# Example SOL: LOWER_PRICE=80, UPPER_PRICE=120, VIRTUAL_GRID_STEP=0.001.
+# Real order price is still rounded by Binance tick size.
+USE_SMART_ANALYSIS = env_bool("USE_SMART_ANALYSIS", "true")
+VIRTUAL_GRID_STEP = env_decimal("VIRTUAL_GRID_STEP", "0.001")
+SIGNAL_CONFIRM_SECONDS = env_float("SIGNAL_CONFIRM_SECONDS", "20")
+ANALYSIS_REFRESH_SECONDS = env_float("ANALYSIS_REFRESH_SECONDS", "5")
+BIAS_THRESHOLD = env_int("BIAS_THRESHOLD", "15")
+STRONG_BIAS_THRESHOLD = env_int("STRONG_BIAS_THRESHOLD", "35")
+COUNTER_BIAS_OFFSET_PCT = env_decimal("COUNTER_BIAS_OFFSET_PCT", "0.0015")  # 0.15% farther from price
+DISABLE_COUNTER_ON_STRONG_BIAS = env_bool("DISABLE_COUNTER_ON_STRONG_BIAS", "false")
+MAX_SPREAD_PCT = env_decimal("MAX_SPREAD_PCT", "0.0015")  # 0.15%; skip if spread is crazy
+MAX_FAST_MOVE_PCT = env_decimal("MAX_FAST_MOVE_PCT", "0.012")  # 1.2% fast 5m move => danger/skip
 
 # Main trading logic.
 # Net est is the main clean-profit trigger.
@@ -583,6 +598,248 @@ def cleanup(filters: Dict[str, Decimal], close_positions: bool = True) -> None:
     time.sleep(1)
 
 
+
+# ============================================================
+# SMART MARKET ANALYZER
+# ============================================================
+
+def get_klines(interval: str, limit: int = 80) -> List[List[Any]]:
+    return public_get("/fapi/v1/klines", {"symbol": SYMBOL, "interval": interval, "limit": limit})
+
+
+def candle_close(kline: List[Any]) -> Decimal:
+    return Decimal(str(kline[4]))
+
+
+def candle_high(kline: List[Any]) -> Decimal:
+    return Decimal(str(kline[2]))
+
+
+def candle_low(kline: List[Any]) -> Decimal:
+    return Decimal(str(kline[3]))
+
+
+def candle_volume(kline: List[Any]) -> Decimal:
+    return Decimal(str(kline[5]))
+
+
+def ema_decimal(values: List[Decimal], period: int) -> Decimal:
+    if not values:
+        return Decimal("0")
+    if len(values) < period:
+        return values[-1]
+    k = Decimal("2") / (Decimal(period) + Decimal("1"))
+    ema = sum(values[:period]) / Decimal(period)
+    for value in values[period:]:
+        ema = value * k + ema * (Decimal("1") - k)
+    return ema
+
+
+def rsi_decimal(values: List[Decimal], period: int = 14) -> Decimal:
+    if len(values) <= period:
+        return Decimal("50")
+    gains = Decimal("0")
+    losses = Decimal("0")
+    recent = values[-(period + 1):]
+    for prev, cur in zip(recent, recent[1:]):
+        diff = cur - prev
+        if diff >= 0:
+            gains += diff
+        else:
+            losses += abs(diff)
+    if losses == 0:
+        return Decimal("100")
+    if gains == 0:
+        return Decimal("0")
+    rs = gains / losses
+    return Decimal("100") - (Decimal("100") / (Decimal("1") + rs))
+
+
+def atr_pct_decimal(klines: List[List[Any]], period: int = 14) -> Decimal:
+    if len(klines) < period + 1:
+        return Decimal("0")
+    trs: List[Decimal] = []
+    prev_close = candle_close(klines[-period - 1])
+    for k in klines[-period:]:
+        high = candle_high(k)
+        low = candle_low(k)
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+        prev_close = candle_close(k)
+    close = candle_close(klines[-1])
+    if close <= 0:
+        return Decimal("0")
+    return (sum(trs) / Decimal(len(trs))) / close
+
+
+def pct_change(values: List[Decimal], lookback: int) -> Decimal:
+    if len(values) <= lookback or values[-lookback - 1] <= 0:
+        return Decimal("0")
+    return (values[-1] - values[-lookback - 1]) / values[-lookback - 1]
+
+
+def timeframe_signal(interval: str, weight: int) -> Dict[str, Any]:
+    kl = get_klines(interval, 80)
+    closes = [candle_close(k) for k in kl]
+    if len(closes) < 25:
+        return {"interval": interval, "score": 0, "text": "no_data", "rsi": Decimal("50"), "atr_pct": Decimal("0")}
+
+    ema9 = ema_decimal(closes, 9)
+    ema21 = ema_decimal(closes, 21)
+    ema50 = ema_decimal(closes, 50)
+    rsi = rsi_decimal(closes, 14)
+    change3 = pct_change(closes, 3)
+    change10 = pct_change(closes, 10)
+    atrp = atr_pct_decimal(kl, 14)
+
+    score = 0
+    # EMA structure
+    if closes[-1] > ema9 > ema21:
+        score += 2 * weight
+    elif closes[-1] < ema9 < ema21:
+        score -= 2 * weight
+    elif ema9 > ema21:
+        score += 1 * weight
+    elif ema9 < ema21:
+        score -= 1 * weight
+
+    # Higher timeframe structure
+    if ema21 > ema50:
+        score += 1 * weight
+    elif ema21 < ema50:
+        score -= 1 * weight
+
+    # Momentum, not too sensitive.
+    if change3 > Decimal("0.001"):
+        score += 1 * weight
+    elif change3 < Decimal("-0.001"):
+        score -= 1 * weight
+    if change10 > Decimal("0.002"):
+        score += 1 * weight
+    elif change10 < Decimal("-0.002"):
+        score -= 1 * weight
+
+    # RSI supports direction, but extremes reduce confidence because reversal risk grows.
+    if Decimal("55") <= rsi <= Decimal("72"):
+        score += 1 * weight
+    elif Decimal("28") <= rsi <= Decimal("45"):
+        score -= 1 * weight
+    elif rsi > Decimal("78"):
+        score -= 1 * weight
+    elif rsi < Decimal("22"):
+        score += 1 * weight
+
+    if score > 0:
+        text = "up"
+    elif score < 0:
+        text = "down"
+    else:
+        text = "flat"
+
+    return {
+        "interval": interval,
+        "score": int(score),
+        "text": text,
+        "close": closes[-1],
+        "ema9": ema9,
+        "ema21": ema21,
+        "ema50": ema50,
+        "rsi": rsi,
+        "change3": change3,
+        "change10": change10,
+        "atr_pct": atrp,
+    }
+
+
+def analyze_market(filters: Optional[Dict[str, Decimal]] = None) -> Dict[str, Any]:
+    if not USE_SMART_ANALYSIS:
+        return {"mode": "RANGE", "score": 0, "bias": "NEUTRAL", "danger": False, "reason": "smart_analysis_off", "details": []}
+
+    bid, ask, mid = get_book()
+    spread_pct = ((ask - bid) / mid) if mid > 0 else Decimal("0")
+
+    # We use supported Binance intervals. 10m is represented by 1m/5m + 15m context to avoid unsupported kline intervals.
+    weights = {"1m": 1, "5m": 2, "15m": 3, "1h": 4}
+    details = []
+    total_score = 0
+    max_fast_move = Decimal("0")
+    max_atr = Decimal("0")
+
+    for interval, weight in weights.items():
+        try:
+            sig = timeframe_signal(interval, weight)
+            details.append(sig)
+            total_score += int(sig.get("score", 0))
+            max_fast_move = max(max_fast_move, abs(Decimal(str(sig.get("change3", "0")))))
+            max_atr = max(max_atr, Decimal(str(sig.get("atr_pct", "0"))))
+        except Exception as error:
+            details.append({"interval": interval, "score": 0, "text": f"error:{type(error).__name__}", "rsi": Decimal("50"), "atr_pct": Decimal("0")})
+
+    danger_reasons = []
+    if mid <= LOWER_PRICE or mid >= UPPER_PRICE:
+        danger_reasons.append("outside_range")
+    if spread_pct > MAX_SPREAD_PCT:
+        danger_reasons.append(f"spread>{(MAX_SPREAD_PCT*Decimal('100')):.3f}%")
+    if max_fast_move > MAX_FAST_MOVE_PCT:
+        danger_reasons.append(f"fast_move>{(MAX_FAST_MOVE_PCT*Decimal('100')):.2f}%")
+
+    if danger_reasons:
+        mode = "DANGER_SKIP"
+        bias = "SKIP"
+    elif total_score >= STRONG_BIAS_THRESHOLD:
+        mode = "STRONG_LONG_BIAS"
+        bias = "LONG"
+    elif total_score >= BIAS_THRESHOLD:
+        mode = "LONG_BIAS"
+        bias = "LONG"
+    elif total_score <= -STRONG_BIAS_THRESHOLD:
+        mode = "STRONG_SHORT_BIAS"
+        bias = "SHORT"
+    elif total_score <= -BIAS_THRESHOLD:
+        mode = "SHORT_BIAS"
+        bias = "SHORT"
+    else:
+        mode = "RANGE_NEUTRAL"
+        bias = "NEUTRAL"
+
+    reason_parts = [f"score={total_score}", f"spread={(spread_pct*Decimal('100')):.4f}%"]
+    if danger_reasons:
+        reason_parts.append("danger=" + ",".join(danger_reasons))
+    for d in details:
+        rsi = d.get("rsi", Decimal("50"))
+        try:
+            rsi_text = f"{Decimal(str(rsi)):.1f}"
+        except Exception:
+            rsi_text = str(rsi)
+        reason_parts.append(f"{d.get('interval')}:{d.get('text')}({d.get('score')},rsi={rsi_text})")
+
+    return {
+        "mode": mode,
+        "bias": bias,
+        "score": total_score,
+        "danger": bool(danger_reasons),
+        "danger_reasons": danger_reasons,
+        "reason": " | ".join(reason_parts),
+        "details": details,
+        "bid": bid,
+        "ask": ask,
+        "mid": mid,
+        "spread_pct": spread_pct,
+        "max_atr_pct": max_atr,
+    }
+
+
+def snap_virtual_price(value: Decimal, side: str, filters: Dict[str, Decimal]) -> Decimal:
+    # Virtual grid step is a planning grid. Binance tick size is the final hard rounding.
+    virtual_step = max(VIRTUAL_GRID_STEP, filters["tick"])
+    if side == "BUY":
+        return floor_step(floor_step(value, virtual_step), filters["tick"])
+    return ceil_step(ceil_step(value, virtual_step), filters["tick"])
+
+
+def analysis_short_text(analysis: Dict[str, Any]) -> str:
+    return f"{analysis.get('mode')} | score {analysis.get('score')} | {analysis.get('reason')}"
+
 # ============================================================
 # GRID CYCLE
 # ============================================================
@@ -608,6 +865,10 @@ class OneShotNetGridCycle:
         self.entry_revision = 0
         self.current_long_entry_price = Decimal('0')
         self.current_short_entry_price = Decimal('0')
+        self.last_analysis: Dict[str, Any] = {"mode": "RANGE_NEUTRAL", "bias": "NEUTRAL", "score": 0, "reason": "init"}
+        self.last_analysis_at = 0.0
+        self.last_signal_mode = None
+        self.last_signal_since = 0.0
 
     def build_levels(self):
         step = (UPPER_PRICE - LOWER_PRICE) / Decimal(GRID_COUNT)
@@ -658,82 +919,158 @@ class OneShotNetGridCycle:
         self.register_order(data, "ENTRY", "SHORT", level_index, price, qty)
         return True
 
-    def compute_offset_entry_prices(self):
-        bid, ask, mid = get_book()
-        tick = self.filters["tick"]
-        offset = ENTRY_OFFSET_PCT
+    def get_market_analysis(self, force: bool = False) -> Dict[str, Any]:
+        now = time.monotonic()
+        if force or not self.last_analysis or now - self.last_analysis_at >= ANALYSIS_REFRESH_SECONDS:
+            self.last_analysis = analyze_market(self.filters)
+            self.last_analysis_at = now
+        return self.last_analysis
 
-        # Adaptive offset entry: LONG below best bid, SHORT above best ask.
-        long_price = floor_step(bid * (Decimal("1") - offset), tick)
-        short_price = ceil_step(ask * (Decimal("1") + offset), tick)
+    def signal_is_confirmed(self, analysis: Dict[str, Any]) -> bool:
+        mode = str(analysis.get("mode", "RANGE_NEUTRAL"))
+        now = time.monotonic()
+        if mode != self.last_signal_mode:
+            self.last_signal_mode = mode
+            self.last_signal_since = now
+            return SIGNAL_CONFIRM_SECONDS <= 0
+        return (now - self.last_signal_since) >= SIGNAL_CONFIRM_SECONDS
+
+    def wait_for_stable_signal(self) -> Dict[str, Any]:
+        if not USE_SMART_ANALYSIS or SIGNAL_CONFIRM_SECONDS <= 0:
+            return self.get_market_analysis(force=True)
+
+        log(f"🧠 Аналізую ринок {SIGNAL_CONFIRM_SECONDS:.0f} сек перед входом...", telegram=True)
+        last_notify = 0.0
+        while True:
+            analysis = self.get_market_analysis(force=True)
+            confirmed = self.signal_is_confirmed(analysis)
+            now = time.monotonic()
+            if now - last_notify >= 5:
+                log(f"🧠 Signal check: {analysis_short_text(analysis)}")
+                last_notify = now
+            if confirmed:
+                return analysis
+            time.sleep(min(ANALYSIS_REFRESH_SECONDS, 2.0))
+
+    def compute_offset_entry_prices(self, analysis: Optional[Dict[str, Any]] = None):
+        bid, ask, mid = get_book()
+        if analysis is None:
+            analysis = self.get_market_analysis(force=False)
+
+        bias = str(analysis.get("bias", "NEUTRAL"))
+        mode = str(analysis.get("mode", "RANGE_NEUTRAL"))
+
+        if analysis.get("danger") or bias == "SKIP":
+            return bid, ask, mid, Decimal("0"), Decimal("0"), False, False, analysis
+
+        # Neutral: both orders close. Bias: favored side close, counter side farther.
+        long_offset = ENTRY_OFFSET_PCT
+        short_offset = ENTRY_OFFSET_PCT
+        place_long = True
+        place_short = True
+
+        if bias == "LONG":
+            long_offset = ENTRY_OFFSET_PCT
+            short_offset = COUNTER_BIAS_OFFSET_PCT
+            if mode == "STRONG_LONG_BIAS" and DISABLE_COUNTER_ON_STRONG_BIAS:
+                place_short = False
+        elif bias == "SHORT":
+            short_offset = ENTRY_OFFSET_PCT
+            long_offset = COUNTER_BIAS_OFFSET_PCT
+            if mode == "STRONG_SHORT_BIAS" and DISABLE_COUNTER_ON_STRONG_BIAS:
+                place_long = False
+
+        # Entry plan from live book, snapped to virtual grid and then Binance tick size.
+        long_raw = bid * (Decimal("1") - long_offset)
+        short_raw = ask * (Decimal("1") + short_offset)
+        long_price = snap_virtual_price(long_raw, "BUY", self.filters)
+        short_price = snap_virtual_price(short_raw, "SELL", self.filters)
 
         # Extra protection after rounding: never cross the book accidentally.
         if long_price >= ask:
-            long_price = floor_step(ask - tick, tick)
+            long_price = floor_step(ask - self.filters["tick"], self.filters["tick"])
         if short_price <= bid:
-            short_price = ceil_step(bid + tick, tick)
+            short_price = ceil_step(bid + self.filters["tick"], self.filters["tick"])
 
-        return bid, ask, mid, long_price, short_price
+        return bid, ask, mid, long_price, short_price, place_long, place_short, analysis
 
     def place_offset_entry_pair(self, reason: str = "START", notify: bool = False) -> bool:
-        bid, ask, mid, long_price, short_price = self.compute_offset_entry_prices()
+        analysis = self.get_market_analysis(force=True)
+        bid, ask, mid, long_price, short_price, place_long, place_short, analysis = self.compute_offset_entry_prices(analysis)
 
         if mid <= LOWER_PRICE or mid >= UPPER_PRICE:
             log(f"🟡 Ціна {mid} поза діапазоном {LOWER_PRICE}-{UPPER_PRICE}")
             return False
 
-        if long_price <= 0 or short_price <= 0:
+        if analysis.get("danger") or analysis.get("bias") == "SKIP":
+            log(f"🟡 SKIP entry: {analysis_short_text(analysis)}", telegram=notify)
+            self.last_reprice_at = time.monotonic()
+            return False
+
+        if (place_long and long_price <= 0) or (place_short and short_price <= 0):
             log("🟡 Не вдалося розрахувати коректні entry-ціни")
             return False
 
         self.entry_revision += 1
-        self.current_long_entry_price = long_price
-        self.current_short_entry_price = short_price
+        self.current_long_entry_price = long_price if place_long else Decimal("0")
+        self.current_short_entry_price = short_price if place_short else Decimal("0")
         self.last_reprice_at = time.monotonic()
 
         placed_long = 0
         placed_short = 0
         try:
-            placed_long = 1 if self.place_long_entry(self.entry_revision * 10, long_price) else 0
-            time.sleep(0.02)
-            placed_short = 1 if self.place_short_entry(self.entry_revision * 10 + 1, short_price) else 0
+            if place_long:
+                placed_long = 1 if self.place_long_entry(self.entry_revision * 10, long_price) else 0
+                time.sleep(0.02)
+            if place_short:
+                placed_short = 1 if self.place_short_entry(self.entry_revision * 10 + 1, short_price) else 0
         except Exception as error:
-            log(f"⚠️ Не зміг виставити adaptive entry ордери: {error}", telegram=True)
+            log(f"⚠️ Не зміг виставити smart adaptive entry ордери: {error}", telegram=True)
             return False
 
-        max_active_notional = ORDER_NOTIONAL_USDT * Decimal("2")
-        max_active_margin = max_active_notional / Decimal(LEVERAGE)
+        max_active_orders = Decimal(placed_long + placed_short)
+        max_active_notional = ORDER_NOTIONAL_USDT * max_active_orders
+        max_active_margin = max_active_notional / Decimal(LEVERAGE) if LEVERAGE else Decimal("0")
 
         msg = (
-            f"🔁 Adaptive entry {reason} #{self.entry_revision}\n"
+            f"🔁 Smart adaptive entry {reason} #{self.entry_revision}\n"
             f"{SYMBOL} bid/ask/mid: {bid} / {ask} / {mid}\n"
-            f"BUY LONG: {long_price}\n"
-            f"SELL SHORT: {short_price}\n"
-            f"Offset: {(ENTRY_OFFSET_PCT * Decimal('100')):.4f}% | Reprice: {REPRICE_ENTRY_SECONDS}s\n"
-            f"Orders: LONG {placed_long} + SHORT {placed_short}\n"
+            f"Mode: {analysis.get('mode')} | Bias: {analysis.get('bias')} | Score: {analysis.get('score')}\n"
+            f"Reason: {analysis.get('reason')}\n"
+            f"Virtual range/grid: {LOWER_PRICE}-{UPPER_PRICE} step {VIRTUAL_GRID_STEP}\n"
+            f"BUY LONG: {long_price if place_long else 'disabled'}\n"
+            f"SELL SHORT: {short_price if place_short else 'disabled'}\n"
+            f"Near offset: {(ENTRY_OFFSET_PCT * Decimal('100')):.4f}% | Counter offset: {(COUNTER_BIAS_OFFSET_PCT * Decimal('100')):.4f}%\n"
+            f"Reprice: {REPRICE_ENTRY_SECONDS}s | Orders: LONG {placed_long} + SHORT {placed_short}\n"
             f"Notional per entry: {ORDER_NOTIONAL_USDT} USDT | Max active margin ≈ {max_active_margin:.2f} USDT"
         )
         log(msg, telegram=notify)
         return placed_long + placed_short > 0
 
     def start(self) -> bool:
-        bid, ask, mid, long_price, short_price = self.compute_offset_entry_prices()
+        analysis = self.wait_for_stable_signal()
+        bid, ask, mid, long_price, short_price, place_long, place_short, analysis = self.compute_offset_entry_prices(analysis)
         if mid <= LOWER_PRICE or mid >= UPPER_PRICE:
             log(f"🟡 Ціна {mid} поза діапазоном {LOWER_PRICE}-{UPPER_PRICE}")
             return False
+        if analysis.get("danger") or analysis.get("bias") == "SKIP":
+            log(f"🟡 Вхід пропущено: {analysis_short_text(analysis)}", telegram=True)
+            return False
 
-        max_active_notional = ORDER_NOTIONAL_USDT * Decimal("2")
-        max_active_margin = max_active_notional / Decimal(LEVERAGE)
+        active_orders = Decimal((1 if place_long else 0) + (1 if place_short else 0))
+        max_active_notional = ORDER_NOTIONAL_USDT * active_orders
+        max_active_margin = max_active_notional / Decimal(LEVERAGE) if LEVERAGE else Decimal("0")
 
         header = (
-            f"🟢 ADAPTIVE NEUTRAL CYCLE #{self.cycle_number}\n"
+            f"🟢 SMART ADAPTIVE CYCLE #{self.cycle_number}\n"
             f"{SYMBOL} bid/ask/mid: {bid} / {ask} / {mid}\n"
-            f"Range guard: {LOWER_PRICE} - {UPPER_PRICE}\n"
-            f"Entry offset: {(ENTRY_OFFSET_PCT * Decimal('100')):.4f}%\n"
-            f"Reprice entry every: {REPRICE_ENTRY_SECONDS}s | min move: {(REPRICE_MIN_MOVE_PCT * Decimal('100')):.4f}%\n"
-            f"Initial BUY LONG price: {long_price}\n"
-            f"Initial SELL SHORT price: {short_price}\n"
-            f"Orders: 1 LONG + 1 SHORT, then adaptive reprice until fill\n"
+            f"Virtual range: {LOWER_PRICE} - {UPPER_PRICE} | virtual step {VIRTUAL_GRID_STEP}\n"
+            f"Mode: {analysis.get('mode')} | Bias: {analysis.get('bias')} | Score: {analysis.get('score')}\n"
+            f"Analysis: {analysis.get('reason')}\n"
+            f"Signal confirmation: {SIGNAL_CONFIRM_SECONDS}s | refresh: {ANALYSIS_REFRESH_SECONDS}s\n"
+            f"Initial BUY LONG price: {long_price if place_long else 'disabled'}\n"
+            f"Initial SELL SHORT price: {short_price if place_short else 'disabled'}\n"
+            f"Orders: adaptive smart, then reprice until fill\n"
             f"Notional per entry: {ORDER_NOTIONAL_USDT} USDT\n"
             f"Max active margin ≈ {max_active_margin:.2f} USDT\n"
             f"Take Net est: +{TAKE_NET_PROFIT} USDT | Stop Net est: {MAX_CYCLE_LOSS} USDT\n"
@@ -756,17 +1093,30 @@ class OneShotNetGridCycle:
             return False
 
         try:
-            bid, ask, mid, new_long, new_short = self.compute_offset_entry_prices()
+            analysis = self.get_market_analysis(force=True)
+            if not self.signal_is_confirmed(analysis):
+                return False
+            bid, ask, mid, new_long, new_short, place_long, place_short, analysis = self.compute_offset_entry_prices(analysis)
         except Exception:
             return True
 
-        # If current entry prices are empty, reprice.
-        if self.current_long_entry_price <= 0 or self.current_short_entry_price <= 0:
+        if analysis.get("danger") or analysis.get("bias") == "SKIP":
             return True
 
-        long_move = abs(new_long - self.current_long_entry_price) / self.current_long_entry_price
-        short_move = abs(new_short - self.current_short_entry_price) / self.current_short_entry_price
-        return long_move >= REPRICE_MIN_MOVE_PCT or short_move >= REPRICE_MIN_MOVE_PCT
+        # If current entry prices are empty but that side should be active, reprice.
+        if place_long and self.current_long_entry_price <= 0:
+            return True
+        if place_short and self.current_short_entry_price <= 0:
+            return True
+
+        moves = []
+        if place_long and self.current_long_entry_price > 0:
+            moves.append(abs(new_long - self.current_long_entry_price) / self.current_long_entry_price)
+        if place_short and self.current_short_entry_price > 0:
+            moves.append(abs(new_short - self.current_short_entry_price) / self.current_short_entry_price)
+        if not moves:
+            return True
+        return max(moves) >= REPRICE_MIN_MOVE_PCT
 
     def reprice_entry_orders_if_needed(self, stats: Optional[Dict[str, Decimal]] = None) -> None:
         """While flat, cancel stale entry orders and recreate them around live price."""
@@ -1158,7 +1508,8 @@ def run_cycle(cycle_number: int, filters: Dict[str, Decimal], taker_fee: Decimal
                 f"exec PnL: {stats['unrealized']:+.4f} | "
                 f"bid/ask: {stats['bid']}/{stats['ask']} | "
                 f"closePx: {stats['close_price']} | spread: {stats['spread']} | "
-                f"fees: {stats['entry_fee_est']:.4f}+{stats['exit_fee_est']:.4f}"
+                f"fees: {stats['entry_fee_est']:.4f}+{stats['exit_fee_est']:.4f} | "
+                f"mode: {cycle.last_analysis.get('mode', 'NA')} score: {cycle.last_analysis.get('score', 'NA')}"
             )
             log(line)
             last_print = now
@@ -1186,13 +1537,16 @@ def main() -> None:
     require_env()
 
     banner = (
-        f"🤖 {SYMBOL} ADAPTIVE NEUTRAL OFFSET BOT v5\n"
+        f"🤖 {SYMBOL} SMART ADAPTIVE NEUTRAL BOT v6\n"
         f"Time: {now_utc()}\n"
         f"Base URL: {BASE_URL}\n"
         f"Range: {LOWER_PRICE} - {UPPER_PRICE} | Grid: {GRID_COUNT}\n"
         f"Budget: {MARGIN_BUDGET_USDT} USDT | Leverage: {LEVERAGE}x\n"
         f"Order notional: {ORDER_NOTIONAL_USDT} USDT\n"
         f"Entry offset: {(ENTRY_OFFSET_PCT * Decimal('100')):.4f}% from bid/ask\n"
+        f"Virtual range/grid: {LOWER_PRICE}-{UPPER_PRICE}, step {VIRTUAL_GRID_STEP}\n"
+        f"Smart analysis: {'on' if USE_SMART_ANALYSIS else 'off'} | confirm {SIGNAL_CONFIRM_SECONDS}s | refresh {ANALYSIS_REFRESH_SECONDS}s\n"
+        f"Bias thresholds: {BIAS_THRESHOLD}/{STRONG_BIAS_THRESHOLD} | counter offset {(COUNTER_BIAS_OFFSET_PCT * Decimal('100')):.4f}%\n"
         f"Adaptive reprice: every {REPRICE_ENTRY_SECONDS}s, min move {(REPRICE_MIN_MOVE_PCT * Decimal('100')):.4f}%\n"
         f"TAKE Net est: +{TAKE_NET_PROFIT} USDT\n"
         f"TAKE exchange uPnL: +{TAKE_EXCHANGE_UPNL} USDT with Net guard {EXCHANGE_TAKE_MIN_NET}\n"
