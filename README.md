@@ -1,67 +1,34 @@
-# ONEUSDT One-Shot Net Est Grid Bot
+# Smart Adaptive Neutral Bot v6.1.1 — Clean Telegram
 
-Python bot for Binance USD-M Futures Demo with Telegram notifications and Railway deployment.
+Зміни цієї версії:
 
-## Logic
+- Торгова логіка залишена від v6.1 env-safe.
+- Telegram повідомлення переписані українською і структуровано.
+- Прибрано зайві Telegram-повідомлення про кожен аналіз/skip/reprice.
+- Залишено важливі події: старт, підготовка входу, відкриття позиції, TP-ордер, статус позиції, закриття, підсумок.
+- `TELEGRAM_STATUS_EVERY_SECONDS=0` вимикає періодичні статуси.
 
-- Exchange: Binance Futures Demo by default.
-- Symbol: `ONEUSDT`.
-- Strategy: one-shot grid.
-- Places nearest `BUY LONG` below current bid and nearest `SELL SHORT` above current ask.
-- After the first entry is filled, cancels the opposite entry.
-- Does **not** place TP limit orders.
-- Closes only by `Net est`:
-  - `Net est >= +0.10 USDT` -> close in profit.
-  - `Net est <= -0.40 USDT` -> stop close.
-- Sends Telegram notifications on start, entry, take, stop, API downtime, and summary.
+## LIVE запуск
 
-## Files
+Для реальної біржі в Railway Variables потрібно явно поставити:
 
-- `main.py` — bot.
-- `.env.example` — example environment variables.
-- `requirements.txt` — dependencies.
-- `railway.toml` — Railway start command.
-- `scripts/get_telegram_chat_id.py` — helper to find Telegram chat ID.
-
-## Local setup
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
+```env
+BINANCE_BASE_URL=https://fapi.binance.com
+FORCE_DEMO_ONLY=false
 ```
 
-Fill `.env` with your Binance Demo API key/secret and Telegram token/chat ID.
+Для першого реального тесту краще починати малим розміром:
 
-Run:
-
-```bash
-python main.py
+```env
+ORDER_NOTIONAL_USDT=50
+LEVERAGE=3
 ```
 
-## Telegram setup
+Після перевірки логів, ордерів і фактичних комісій можна збільшувати обсяг.
 
-1. Open Telegram and message `@BotFather`.
-2. Create bot with `/newbot`.
-3. Copy bot token to `TELEGRAM_BOT_TOKEN`.
-4. Send any message to your new bot.
-5. Run:
+## Файли
 
-```bash
-python scripts/get_telegram_chat_id.py
-```
-
-6. Copy `chat.id` to `TELEGRAM_CHAT_ID`.
-
-## Railway setup
-
-1. Push this project to GitHub.
-2. In Railway, create a new project from GitHub repository.
-3. Add all variables from `.env.example` in Railway Variables.
-4. Deploy. Railway will use `python main.py` from `railway.toml`.
-
-## Safety
-
-This project is configured for Binance Futures Demo by default. Do not use real keys until demo testing is stable.
-Never commit `.env` to GitHub.
+- `main.py` — основний бот
+- `requirements.txt` — залежності
+- `.env.example` — приклад змінних
+- `railway.toml` — Railway конфіг
