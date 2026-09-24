@@ -3,7 +3,7 @@ import time
 import hmac
 import hashlib
 import requests
-from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_CEILING
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 from typing import Any, Dict, Optional
@@ -55,6 +55,10 @@ MARGIN_BUDGET_USDT = env_decimal("MARGIN_BUDGET_USDT", "100")
 LEVERAGE = env_int("LEVERAGE", "10")
 ORDER_NOTIONAL_USDT = env_decimal("ORDER_NOTIONAL_USDT", "25")
 ACTIVE_LEVELS_EACH_SIDE = env_int("ACTIVE_LEVELS_EACH_SIDE", "1")
+
+# Entry placement: 0.0001 = 0.01% from current bid/ask.
+# LONG is placed below best bid, SHORT is placed above best ask.
+ENTRY_OFFSET_PCT = env_decimal("ENTRY_OFFSET_PCT", "0.0001")
 
 # Main trading logic: only Net est controls closing.
 TAKE_NET_PROFIT = env_decimal("TAKE_NET_PROFIT", "0.10")
@@ -122,6 +126,12 @@ def round_tick(value: Any, tick: Any) -> Decimal:
     value_d = Decimal(str(value))
     tick_d = Decimal(str(tick))
     return (value_d / tick_d).to_integral_value(rounding=ROUND_HALF_UP) * tick_d
+
+
+def ceil_step(value: Any, step: Any) -> Decimal:
+    value_d = Decimal(str(value))
+    step_d = Decimal(str(step))
+    return (value_d / step_d).to_integral_value(rounding=ROUND_CEILING) * step_d
 
 
 def log(message: str, telegram: bool = False) -> None:
@@ -566,8 +576,7 @@ class OneShotNetGridCycle:
             "processed": False,
         }
 
-    def place_long_entry(self, level_index: int) -> bool:
-        price = self.levels[level_index]
+    def place_long_entry(self, level_index: int, price: Decimal) -> bool:
         qty = self.qty_for_price(price)
         if qty < self.filters["min_qty"]:
             return False
@@ -576,8 +585,7 @@ class OneShotNetGridCycle:
         self.register_order(data, "ENTRY", "LONG", level_index, price, qty)
         return True
 
-    def place_short_entry(self, level_index: int) -> bool:
-        price = self.levels[level_index]
+    def place_short_entry(self, level_index: int, price: Decimal) -> bool:
         qty = self.qty_for_price(price)
         if qty < self.filters["min_qty"]:
             return False
@@ -592,28 +600,37 @@ class OneShotNetGridCycle:
             log(f"🟡 Ціна {mid} поза діапазоном {LOWER_PRICE}-{UPPER_PRICE}")
             return False
 
-        all_buy_indices = [i for i, price in enumerate(self.levels) if price < bid]
-        all_sell_indices = [i for i, price in enumerate(self.levels) if price > ask]
-        buy_indices = all_buy_indices[-ACTIVE_LEVELS_EACH_SIDE:]
-        sell_indices = all_sell_indices[:ACTIVE_LEVELS_EACH_SIDE]
-        active_cells = len(buy_indices) + len(sell_indices)
+        tick = self.filters["tick"]
+        offset = ENTRY_OFFSET_PCT
 
-        if active_cells == 0:
-            log("🟡 Немає активних рівнів для старту")
+        # Fast offset entry: orders are placed close to the live order book.
+        # Example: offset 0.0001 = 0.01%.
+        # LONG is slightly below bid, SHORT is slightly above ask, so they remain limit orders.
+        long_price = floor_step(bid * (Decimal("1") - offset), tick)
+        short_price = ceil_step(ask * (Decimal("1") + offset), tick)
+
+        # Extra protection after rounding: do not let orders cross the book accidentally.
+        if long_price >= ask:
+            long_price = floor_step(ask - tick, tick)
+        if short_price <= bid:
+            short_price = ceil_step(bid + tick, tick)
+
+        if long_price <= 0 or short_price <= 0:
+            log("🟡 Не вдалося розрахувати коректні entry-ціни")
             return False
 
-        nearest_buy = self.levels[buy_indices[-1]] if buy_indices else None
-        nearest_sell = self.levels[sell_indices[0]] if sell_indices else None
+        active_cells = 2
         max_active_notional = ORDER_NOTIONAL_USDT * Decimal(active_cells)
         max_active_margin = max_active_notional / Decimal(LEVERAGE)
 
         header = (
-            f"🟢 GRID CYCLE #{self.cycle_number}\n"
+            f"🟢 OFFSET ENTRY CYCLE #{self.cycle_number}\n"
             f"{SYMBOL} bid/ask/mid: {bid} / {ask} / {mid}\n"
-            f"Range: {LOWER_PRICE} - {UPPER_PRICE}\n"
-            f"Nearest BUY LONG: {nearest_buy}\n"
-            f"Nearest SELL SHORT: {nearest_sell}\n"
-            f"Orders: {ACTIVE_LEVELS_EACH_SIDE} LONG + {ACTIVE_LEVELS_EACH_SIDE} SHORT\n"
+            f"Range guard: {LOWER_PRICE} - {UPPER_PRICE}\n"
+            f"Entry offset: {(ENTRY_OFFSET_PCT * Decimal('100')):.4f}%\n"
+            f"BUY LONG price: {long_price}\n"
+            f"SELL SHORT price: {short_price}\n"
+            f"Orders: 1 LONG + 1 SHORT\n"
             f"Notional per entry: {ORDER_NOTIONAL_USDT} USDT\n"
             f"Max active margin ≈ {max_active_margin:.2f} USDT\n"
             f"Take Net est: +{TAKE_NET_PROFIT} USDT | Stop Net est: {MAX_CYCLE_LOSS} USDT"
@@ -622,16 +639,10 @@ class OneShotNetGridCycle:
         log(header, telegram=True)
         log("=" * 68)
 
-        placed_long = 0
-        placed_short = 0
-        for i in buy_indices:
-            if self.place_long_entry(i):
-                placed_long += 1
-            time.sleep(0.03)
-        for i in sell_indices:
-            if self.place_short_entry(i):
-                placed_short += 1
-            time.sleep(0.03)
+        placed_long = 1 if self.place_long_entry(0, long_price) else 0
+        time.sleep(0.03)
+        placed_short = 1 if self.place_short_entry(1, short_price) else 0
+        time.sleep(0.03)
 
         log(f"✅ Entry orders: {placed_long + placed_short} (LONG {placed_long} / SHORT {placed_short})")
         log(f"💵 Wallet на старті циклу: {self.start_wallet:.4f} USDT")
@@ -681,46 +692,84 @@ class OneShotNetGridCycle:
         bid, ask, mid = get_book()
 
         executable_unrealized = Decimal("0")
-        position_notional = Decimal("0")
+        exit_notional = Decimal("0")
+        entry_notional = Decimal("0")
+
+        # IMPORTANT:
+        # Do NOT add wallet_change to Net est while an isolated position is open.
+        # In isolated margin Binance may move margin from the wallet to the position.
+        # That locked margin is not a real trading loss and must not trigger/avoid exits.
 
         # LONG closes by SELL at bid.
         long_amount = abs(positions["LONG"]["amount"])
         long_entry = positions["LONG"]["entry_price"]
         if long_amount > 0:
             executable_unrealized += ((bid - long_entry) * long_amount) if long_entry > 0 else positions["LONG"]["unrealized"]
-            position_notional += long_amount * bid
+            exit_notional += long_amount * bid
+            if long_entry > 0:
+                entry_notional += long_amount * long_entry
 
         # SHORT closes by BUY at ask.
         short_amount = abs(positions["SHORT"]["amount"])
         short_entry = positions["SHORT"]["entry_price"]
         if short_amount > 0:
             executable_unrealized += ((short_entry - ask) * short_amount) if short_entry > 0 else positions["SHORT"]["unrealized"]
-            position_notional += short_amount * ask
+            exit_notional += short_amount * ask
+            if short_entry > 0:
+                entry_notional += short_amount * short_entry
 
         both_amount = positions["BOTH"]["amount"]
         both_entry = positions["BOTH"]["entry_price"]
         if both_amount > 0:
             qty = abs(both_amount)
             executable_unrealized += ((bid - both_entry) * qty) if both_entry > 0 else positions["BOTH"]["unrealized"]
-            position_notional += qty * bid
+            exit_notional += qty * bid
+            if both_entry > 0:
+                entry_notional += qty * both_entry
         elif both_amount < 0:
             qty = abs(both_amount)
             executable_unrealized += ((both_entry - ask) * qty) if both_entry > 0 else positions["BOTH"]["unrealized"]
-            position_notional += qty * ask
+            exit_notional += qty * ask
+            if both_entry > 0:
+                entry_notional += qty * both_entry
 
-        exit_fee_est = position_notional * self.taker_fee
-        net = wallet_change + executable_unrealized - exit_fee_est
+        entry_fee_est = entry_notional * self.taker_fee
+        exit_fee_est = exit_notional * self.taker_fee
+
+        # Net est is now the estimated clean result if we close right now:
+        # executable PnL minus estimated entry and exit commissions.
+        net = executable_unrealized - entry_fee_est - exit_fee_est
         exchange_unrealized = sum(item["unrealized"] for item in positions.values())
+
+        active_side = "NONE"
+        active_entry_price = Decimal("0")
+        position_amount = Decimal("0")
+        if long_amount > 0:
+            active_side = "LONG"
+            active_entry_price = long_entry
+            position_amount = long_amount
+        elif short_amount > 0:
+            active_side = "SHORT"
+            active_entry_price = short_entry
+            position_amount = short_amount
+        elif both_amount != 0:
+            active_side = "LONG" if both_amount > 0 else "SHORT"
+            active_entry_price = both_entry
+            position_amount = abs(both_amount)
 
         return {
             "wallet": wallet_now,
             "wallet_change": wallet_change,
             "unrealized": executable_unrealized,
             "exchange_unrealized": exchange_unrealized,
+            "entry_fee_est": entry_fee_est,
             "exit_fee_est": exit_fee_est,
             "net": net,
             "bid": bid,
             "ask": ask,
+            "active_side": active_side,
+            "active_entry_price": active_entry_price,
+            "position_amount": position_amount,
         }
 
 
@@ -785,8 +834,10 @@ def run_cycle(cycle_number: int, filters: Dict[str, Decimal], taker_fee: Decimal
                 f"📊 Cycle #{cycle_number} | Time: {format_duration(now - cycle_started_at)} | "
                 f"Net est: {stats['net']:+.4f} | "
                 f"Wallet Δ: {stats['wallet_change']:+.4f} | "
+                f"Entry: {stats['active_side']} @ {stats['active_entry_price']} qty {stats['position_amount']} | "
                 f"exchange uPnL: {stats['exchange_unrealized']:+.4f} | "
                 f"exec PnL: {stats['unrealized']:+.4f} | "
+                f"entry fee est: {stats['entry_fee_est']:.4f} | "
                 f"exit fee est: {stats['exit_fee_est']:.4f}"
             )
             log(line)
@@ -796,6 +847,7 @@ def run_cycle(cycle_number: int, filters: Dict[str, Decimal], taker_fee: Decimal
             tg_send(
                 f"📊 {SYMBOL} Cycle #{cycle_number}\n"
                 f"Time: {format_duration(now - cycle_started_at)}\n"
+                f"Entry: {stats['active_side']} @ {stats['active_entry_price']} qty {stats['position_amount']}\n"
                 f"Net est: {stats['net']:+.4f} USDT\n"
                 f"Take: +{TAKE_NET_PROFIT} | Stop: {MAX_CYCLE_LOSS}"
             )
@@ -824,6 +876,7 @@ def main() -> None:
         f"Range: {LOWER_PRICE} - {UPPER_PRICE} | Grid: {GRID_COUNT}\n"
         f"Budget: {MARGIN_BUDGET_USDT} USDT | Leverage: {LEVERAGE}x\n"
         f"Order notional: {ORDER_NOTIONAL_USDT} USDT\n"
+        f"Entry offset: {(ENTRY_OFFSET_PCT * Decimal('100')):.4f}% from bid/ask\n"
         f"TAKE Net est: +{TAKE_NET_PROFIT} USDT\n"
         f"STOP Net est: {MAX_CYCLE_LOSS} USDT\n"
         f"Runtime: {format_duration(TOTAL_RUNTIME_SECONDS)}\n"
