@@ -89,7 +89,7 @@ ENTRY_OFFSET_PCT = env_decimal("ENTRY_OFFSET_PCT", "0.0001")
 
 # Adaptive entry: while no position is filled, refresh both entry orders around live bid/ask.
 # This prevents old orders from standing far away after the market moves.
-REPRICE_ENTRY_SECONDS = env_float("REPRICE_ENTRY_SECONDS", "10")
+REPRICE_ENTRY_SECONDS = env_float("REPRICE_ENTRY_SECONDS", "30")
 REPRICE_MIN_MOVE_PCT = env_decimal("REPRICE_MIN_MOVE_PCT", "0.00005")  # 0.005%
 
 # Smart adaptive layer.
@@ -99,7 +99,7 @@ REPRICE_MIN_MOVE_PCT = env_decimal("REPRICE_MIN_MOVE_PCT", "0.00005")  # 0.005%
 USE_SMART_ANALYSIS = env_bool("USE_SMART_ANALYSIS", "true")
 VIRTUAL_GRID_STEP = env_decimal("VIRTUAL_GRID_STEP", "0.001")
 SIGNAL_CONFIRM_SECONDS = env_float("SIGNAL_CONFIRM_SECONDS", "20")
-ANALYSIS_REFRESH_SECONDS = env_float("ANALYSIS_REFRESH_SECONDS", "5")
+ANALYSIS_REFRESH_SECONDS = env_float("ANALYSIS_REFRESH_SECONDS", "60")
 BIAS_THRESHOLD = env_int("BIAS_THRESHOLD", "15")
 STRONG_BIAS_THRESHOLD = env_int("STRONG_BIAS_THRESHOLD", "35")
 COUNTER_BIAS_OFFSET_PCT = env_decimal("COUNTER_BIAS_OFFSET_PCT", "0.0015")  # 0.15% farther from price
@@ -127,10 +127,12 @@ DETAILED_TICK_LOG = env_bool("DETAILED_TICK_LOG", "true")
 
 COOLDOWN_SECONDS = env_int("COOLDOWN_SECONDS", "30")
 LOSS_COOLDOWN_SECONDS = env_int("LOSS_COOLDOWN_SECONDS", "30")
-TOTAL_RUNTIME_SECONDS = env_int("TOTAL_RUNTIME_SECONDS", str(4 * 60 * 60))
-CHECK_INTERVAL_SECONDS = env_float("CHECK_INTERVAL_SECONDS", "0.25")
-PRINT_INTERVAL_SECONDS = env_float("PRINT_INTERVAL_SECONDS", "2")
-TELEGRAM_STATUS_EVERY_SECONDS = env_int("TELEGRAM_STATUS_EVERY_SECONDS", "60")
+# 0 = працювати 24/7 без автоматичного завершення сесії.
+TOTAL_RUNTIME_SECONDS = env_int("TOTAL_RUNTIME_SECONDS", "0")
+CHECK_INTERVAL_SECONDS = env_float("CHECK_INTERVAL_SECONDS", "2")
+PRINT_INTERVAL_SECONDS = env_float("PRINT_INTERVAL_SECONDS", "15")
+# 0 = не слати періодичний статус, тільки важливі події.
+TELEGRAM_STATUS_EVERY_SECONDS = env_int("TELEGRAM_STATUS_EVERY_SECONDS", "0")
 
 # Low-latency mode: do not call slow account balance / allOrders on every tick.
 # Position + book are enough to make the close decision.
@@ -138,26 +140,22 @@ LIVE_WALLET_IN_LOOP = env_bool("LIVE_WALLET_IN_LOOP", "false")
 
 # Network protection
 REQUEST_TIMEOUT_SECONDS = env_int("REQUEST_TIMEOUT_SECONDS", "12")
-API_RETRY_SLEEP_SECONDS = env_int("API_RETRY_SLEEP_SECONDS", "5")
-API_DOWNTIME_NOTIFY_EVERY_SECONDS = env_int("API_DOWNTIME_NOTIFY_EVERY_SECONDS", "120")
+API_RETRY_SLEEP_SECONDS = env_int("API_RETRY_SLEEP_SECONDS", "30")
+API_DOWNTIME_NOTIFY_EVERY_SECONDS = env_int("API_DOWNTIME_NOTIFY_EVERY_SECONDS", "300")
+# Rate-limit protection for Binance 429/418.
+# 429 = забагато запитів; 418 = тимчасовий бан IP.
+API_RATE_LIMIT_SLEEP_SECONDS = env_int("API_RATE_LIMIT_SLEEP_SECONDS", "60")
+API_BAN_SLEEP_SECONDS = env_int("API_BAN_SLEEP_SECONDS", "300")
+API_MAX_BACKOFF_SECONDS = env_int("API_MAX_BACKOFF_SECONDS", "600")
+
+# Native TP limit retry control. Default: one attempt only, no spam.
+TP_LIMIT_MAX_ATTEMPTS = env_int("TP_LIMIT_MAX_ATTEMPTS", "1")
+TP_LIMIT_RETRY_SECONDS = env_int("TP_LIMIT_RETRY_SECONDS", "300")
 
 # Safety
 FORCE_DEMO_ONLY = env_bool("FORCE_DEMO_ONLY", "true")
-# Startup safety/reconcile.
-# v6.2 default: NEVER market-close an existing position just because Railway redeployed.
-# If a position exists, the bot adopts it, cancels stale old orders, then recreates TP by current Railway variables.
 CLOSE_ON_START = env_bool("CLOSE_ON_START", "false")
 CLOSE_ON_EXIT = env_bool("CLOSE_ON_EXIT", "false")  # Railway restart should not auto-close unless you want it
-ADOPT_EXISTING_POSITION_ON_START = env_bool("ADOPT_EXISTING_POSITION_ON_START", "true")
-CANCEL_STALE_ORDERS_ON_START = env_bool("CANCEL_STALE_ORDERS_ON_START", "true")
-REFRESH_TP_ON_START = env_bool("REFRESH_TP_ON_START", "true")
-ALLOW_STARTUP_MARKET_CLOSE = env_bool("ALLOW_STARTUP_MARKET_CLOSE", "false")
-
-# Exit safety: do not fire MARKET stop during an abnormal spread spike, unless the real exchange loss is hard-bad.
-MAX_EXIT_SPREAD_PCT = env_decimal("MAX_EXIT_SPREAD_PCT", str(MAX_SPREAD_PCT))
-AVOID_MARKET_CLOSE_ON_WIDE_SPREAD = env_bool("AVOID_MARKET_CLOSE_ON_WIDE_SPREAD", "true")
-HARD_STOP_EXCHANGE_UPNL = env_decimal("HARD_STOP_EXCHANGE_UPNL", "-10.00")
-SPREAD_GUARD_NOTIFY_EVERY_SECONDS = env_int("SPREAD_GUARD_NOTIFY_EVERY_SECONDS", "30")
 
 API_KEY = env_str("BINANCE_API_KEY", "")
 SECRET_KEY = env_str("BINANCE_SECRET_KEY", "")
@@ -171,6 +169,8 @@ TIME_OFFSET_MS = 0
 _LAST_NETWORK_ALERT_AT = 0.0
 _NETWORK_WAS_DOWN = False
 _LAST_TELEGRAM_ERROR_AT = 0.0
+_LAST_RATE_LIMIT_ALERT_AT = 0.0
+_LAST_CYCLE_ERROR_ALERT_AT = 0.0
 
 
 # ============================================================
@@ -200,6 +200,49 @@ def format_duration(seconds: float) -> str:
     if hours > 0:
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
     return f"{minutes:02d}:{secs:02d}"
+
+
+def safe_decimal(value: Any) -> Decimal:
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return Decimal("0")
+
+
+def money(value: Any, digits: int = 4) -> str:
+    return f"{safe_decimal(value):+.{digits}f}"
+
+
+def plain_money(value: Any, digits: int = 4) -> str:
+    return f"{safe_decimal(value):.{digits}f}"
+
+
+def side_ua(side: Any) -> str:
+    s = str(side).upper()
+    if s == "LONG":
+        return "🟢 LONG"
+    if s == "SHORT":
+        return "🔴 SHORT"
+    if s == "BOTH":
+        return "BOTH"
+    return "немає"
+
+
+def mode_ua(mode: Any) -> str:
+    mapping = {
+        "RANGE_NEUTRAL": "нейтрально / боковик",
+        "LONG_BIAS": "перевага LONG",
+        "STRONG_LONG_BIAS": "сильна перевага LONG",
+        "SHORT_BIAS": "перевага SHORT",
+        "STRONG_SHORT_BIAS": "сильна перевага SHORT",
+        "DANGER_SKIP": "небезпечні умови / пропуск",
+        "RANGE": "нейтрально",
+    }
+    return mapping.get(str(mode), str(mode))
+
+
+def trade_mode_label() -> str:
+    return "DEMO" if "demo-fapi" in BASE_URL else "LIVE"
 
 
 def floor_step(value: Any, step: Any) -> Decimal:
@@ -259,10 +302,10 @@ def _notify_network_down(error: Exception) -> None:
 
     if now - _LAST_NETWORK_ALERT_AT >= API_DOWNTIME_NOTIFY_EVERY_SECONDS:
         message = (
-            "⚠️ Binance API недоступний.\n"
-            f"Symbol: {SYMBOL}\n"
-            f"Error: {type(error).__name__}: {error}\n"
-            f"Чекаю {API_RETRY_SLEEP_SECONDS} сек і пробую знову."
+            "⚠️ Binance API тимчасово недоступний\n"
+            f"Пара: {SYMBOL}\n"
+            f"Помилка: {type(error).__name__}: {error}\n"
+            f"Пауза: {API_RETRY_SLEEP_SECONDS} сек"
         )
         log(message, telegram=True)
         _LAST_NETWORK_ALERT_AT = now
@@ -277,11 +320,70 @@ def _notify_network_restored() -> None:
         _NETWORK_WAS_DOWN = False
 
 
+def _extract_binance_error(response: requests.Response) -> Dict[str, Any]:
+    try:
+        data = response.json()
+        if isinstance(data, dict):
+            return data
+        return {"status": response.status_code, "data": data}
+    except Exception:
+        return {"status": response.status_code, "text": response.text}
+
+
+def _rate_limit_sleep_seconds(status_code: int, data: Dict[str, Any]) -> int:
+    """Choose a safe pause for Binance 429/418 without hammering API."""
+    msg = str(data.get("msg") or data.get("text") or "")
+
+    if status_code == 418:
+        seconds = API_BAN_SLEEP_SECONDS
+        match = re.search(r"banned until\s+(\d+)", msg, re.IGNORECASE)
+        if match:
+            try:
+                banned_until_ms = int(match.group(1))
+                now_ms = int(time.time() * 1000)
+                parsed = int((banned_until_ms - now_ms) / 1000) + 5
+                if parsed > 0:
+                    seconds = max(seconds, parsed)
+            except Exception:
+                pass
+        return int(min(max(seconds, API_BAN_SLEEP_SECONDS), API_MAX_BACKOFF_SECONDS))
+
+    return int(min(max(API_RATE_LIMIT_SLEEP_SECONDS, 10), API_MAX_BACKOFF_SECONDS))
+
+
+def _handle_rate_limit(response: requests.Response, data: Dict[str, Any], where: str) -> bool:
+    """Return True if this was a Binance rate-limit response and was handled."""
+    global _LAST_RATE_LIMIT_ALERT_AT, _NETWORK_WAS_DOWN
+
+    code = data.get("code") if isinstance(data, dict) else None
+    if response.status_code not in {418, 429} and code != -1003:
+        return False
+
+    sleep_s = _rate_limit_sleep_seconds(response.status_code, data if isinstance(data, dict) else {})
+    now = time.monotonic()
+    msg = str(data.get("msg", data)) if isinstance(data, dict) else str(data)
+
+    if now - _LAST_RATE_LIMIT_ALERT_AT >= API_DOWNTIME_NOTIFY_EVERY_SECONDS:
+        log(
+            f"🚦 Binance обмежив API-запити\n"
+            f"Пара: {SYMBOL}\n"
+            f"Код: HTTP {response.status_code} / {code}\n"
+            f"Де: {where}\n"
+            f"Пауза: {sleep_s} сек\n"
+            f"Причина: {msg[:250]}",
+            telegram=True,
+        )
+        _LAST_RATE_LIMIT_ALERT_AT = now
+
+    _NETWORK_WAS_DOWN = True
+    time.sleep(sleep_s)
+    return True
+
+
 def request_with_retry(method: str, url: str, **kwargs) -> requests.Response:
     while True:
         try:
             response = SESSION.request(method, url, timeout=REQUEST_TIMEOUT_SECONDS, **kwargs)
-            _notify_network_restored()
             return response
         except requests.exceptions.RequestException as error:
             _notify_network_down(error)
@@ -291,25 +393,21 @@ def request_with_retry(method: str, url: str, **kwargs) -> requests.Response:
 def public_get(endpoint: str, params: Optional[Dict[str, Any]] = None) -> Any:
     while True:
         response = request_with_retry("GET", BASE_URL + endpoint, params=params or {})
+        data = _extract_binance_error(response)
+
+        if _handle_rate_limit(response, data, f"PUBLIC {endpoint}"):
+            continue
+
         try:
             response.raise_for_status()
+            _notify_network_restored()
             return response.json()
         except requests.exceptions.HTTPError as error:
-            # Public endpoint HTTP errors are usually temporary on demo; retry.
             _notify_network_down(error)
             time.sleep(API_RETRY_SLEEP_SECONDS)
         except ValueError as error:
             _notify_network_down(error)
             time.sleep(API_RETRY_SLEEP_SECONDS)
-
-
-def sync_binance_time() -> None:
-    global TIME_OFFSET_MS
-    data = public_get("/fapi/v1/time")
-    server_time = int(data["serverTime"])
-    local_time = int(time.time() * 1000)
-    TIME_OFFSET_MS = server_time - local_time
-    log(f"🕐 Binance time sync: {TIME_OFFSET_MS:+d} ms")
 
 
 def signed_request(
@@ -338,11 +436,10 @@ def signed_request(
 
         url = f"{BASE_URL}{endpoint}?{query}&signature={signature}"
         response = request_with_retry(method, url, headers=HEADERS)
+        data = _extract_binance_error(response)
 
-        try:
-            data = response.json()
-        except Exception:
-            data = {"status": response.status_code, "text": response.text}
+        if _handle_rate_limit(response, data, f"SIGNED {method} {endpoint}"):
+            continue
 
         if (
             response.status_code >= 400
@@ -358,11 +455,20 @@ def signed_request(
             code = data.get("code") if isinstance(data, dict) else None
             if code in ignore_codes:
                 return data
-
-            # API error - not a network crash. Raise so we do not hide real exchange errors.
             raise RuntimeError(f"Binance API error {response.status_code}: {data}")
 
+        _notify_network_restored()
         return data
+
+
+def sync_binance_time() -> None:
+    global TIME_OFFSET_MS
+    data = public_get("/fapi/v1/time")
+    server_time = int(data["serverTime"])
+    local_time = int(time.time() * 1000)
+    TIME_OFFSET_MS = server_time - local_time
+    log(f"🕐 Binance time sync: {TIME_OFFSET_MS:+d} ms")
+
 
 
 # ============================================================
@@ -563,28 +669,6 @@ def fetch_recent_orders() -> Dict[str, Any]:
     return {item["clientOrderId"]: item for item in data}
 
 
-def fetch_open_orders() -> List[Dict[str, Any]]:
-    """Live open orders for current SYMBOL. Used to safely adopt state after Railway redeploy."""
-    data = signed_request("GET", "/fapi/v1/openOrders", {"symbol": SYMBOL})
-    return data if isinstance(data, list) else []
-
-
-def cancel_order_by_id(order_id: Any) -> None:
-    signed_request("DELETE", "/fapi/v1/order", {"symbol": SYMBOL, "orderId": order_id}, ignore_codes={-2011})
-
-
-def order_is_reduce_only(order: Dict[str, Any]) -> bool:
-    value = order.get("reduceOnly", False)
-    return value is True or str(value).lower() == "true"
-
-
-def count_open_orders() -> int:
-    try:
-        return len(fetch_open_orders())
-    except Exception:
-        return 0
-
-
 # ============================================================
 # CLEANUP / CLOSE
 # ============================================================
@@ -658,67 +742,6 @@ def cleanup(filters: Dict[str, Decimal], close_positions: bool = True) -> None:
             log(f"⚠️ Не зміг закрити позиції: {error}", telegram=True)
 
     time.sleep(1)
-
-
-def describe_live_position() -> str:
-    try:
-        positions = get_positions()
-        parts = []
-        for side in ["LONG", "SHORT", "BOTH"]:
-            amt = positions[side]["amount"]
-            if amt != 0:
-                parts.append(f"{side} amount={amt} entry={positions[side]['entry_price']} uPnL={positions[side]['unrealized']}")
-        return "; ".join(parts) if parts else "flat"
-    except Exception as error:
-        return f"unknown position state: {error}"
-
-
-def startup_reconcile(filters: Dict[str, Decimal]) -> None:
-    """
-    v6.2 safe restart logic.
-    - If position exists: adopt it, do NOT market-close it, cancel stale old orders, and let current code recreate TP.
-    - If only old entry orders exist: cancel them and place fresh orders by the new Railway variables.
-    - A market close on startup is only allowed when ALLOW_STARTUP_MARKET_CLOSE=true.
-    """
-    has_position_now = has_open_position()
-    open_count = count_open_orders()
-
-    log(
-        f"🧭 Startup reconcile: position={describe_live_position()} | open orders={open_count} | "
-        f"adopt={ADOPT_EXISTING_POSITION_ON_START} | cancel stale={CANCEL_STALE_ORDERS_ON_START}",
-        telegram=True,
-    )
-
-    if has_position_now:
-        if CLOSE_ON_START and ALLOW_STARTUP_MARKET_CLOSE and not ADOPT_EXISTING_POSITION_ON_START:
-            log("⚠️ CLOSE_ON_START + ALLOW_STARTUP_MARKET_CLOSE=true: закриваю позицію на старті MARKET.", telegram=True)
-            cleanup(filters, close_positions=True)
-            return
-
-        # Main requested behavior: code update/redeploy must continue from existing position.
-        if CANCEL_STALE_ORDERS_ON_START or REFRESH_TP_ON_START:
-            try:
-                cancel_all_orders()
-                log("🧹 Є відкрита позиція: старі ордери скасовано. Позицію НЕ чіпаю. TP буде створено по нових Railway Variables.", telegram=True)
-            except Exception as error:
-                log(f"⚠️ Не зміг скасувати старі ордери при adoption: {error}", telegram=True)
-        else:
-            log("🤝 Є відкрита позиція: приймаю її під контроль без скасування ордерів.", telegram=True)
-        time.sleep(0.5)
-        return
-
-    # Flat account: old entry orders are stale after a deploy or variable change.
-    if open_count > 0 and CANCEL_STALE_ORDERS_ON_START:
-        try:
-            cancel_all_orders()
-            log(f"🧹 Позиції немає: скасував {open_count} старих ордерів. Далі бот поставить нові по актуальній логіці.", telegram=True)
-        except Exception as error:
-            log(f"⚠️ Не зміг скасувати старі ордери на старті: {error}", telegram=True)
-        time.sleep(0.5)
-        return
-
-    if CLOSE_ON_START and ALLOW_STARTUP_MARKET_CLOSE:
-        cleanup(filters, close_positions=True)
 
 
 
@@ -982,6 +1005,9 @@ class OneShotNetGridCycle:
         self.active_side = None
         self.entry_count = 0
         self.tp_order_placed = False
+        self.tp_limit_attempts = 0
+        self.tp_next_retry_at = 0.0
+        self.tp_last_error = ""
         self.best_net = Decimal('-999999')
         self.best_exchange_upnl = Decimal('-999999')
         self.last_reprice_at = 0.0
@@ -992,7 +1018,6 @@ class OneShotNetGridCycle:
         self.last_analysis_at = 0.0
         self.last_signal_mode = None
         self.last_signal_since = 0.0
-        self.last_spread_guard_notify_at = 0.0
 
     def build_levels(self):
         step = (UPPER_PRICE - LOWER_PRICE) / Decimal(GRID_COUNT)
@@ -1063,18 +1088,18 @@ class OneShotNetGridCycle:
         if not USE_SMART_ANALYSIS or SIGNAL_CONFIRM_SECONDS <= 0:
             return self.get_market_analysis(force=True)
 
-        log(f"🧠 Аналізую ринок {SIGNAL_CONFIRM_SECONDS:.0f} сек перед входом...", telegram=True)
+        log(f"🧠 Аналізую ринок {SIGNAL_CONFIRM_SECONDS:.0f} сек перед входом...")
         last_notify = 0.0
         while True:
-            analysis = self.get_market_analysis(force=True)
+            analysis = self.get_market_analysis(force=False)
             confirmed = self.signal_is_confirmed(analysis)
             now = time.monotonic()
-            if now - last_notify >= 5:
+            if now - last_notify >= 15:
                 log(f"🧠 Signal check: {analysis_short_text(analysis)}")
                 last_notify = now
             if confirmed:
                 return analysis
-            time.sleep(min(ANALYSIS_REFRESH_SECONDS, 2.0))
+            time.sleep(min(max(ANALYSIS_REFRESH_SECONDS, 5.0), 15.0))
 
     def compute_offset_entry_prices(self, analysis: Optional[Dict[str, Any]] = None):
         bid, ask, mid = get_book()
@@ -1119,7 +1144,7 @@ class OneShotNetGridCycle:
         return bid, ask, mid, long_price, short_price, place_long, place_short, analysis
 
     def place_offset_entry_pair(self, reason: str = "START", notify: bool = False) -> bool:
-        analysis = self.get_market_analysis(force=True)
+        analysis = self.get_market_analysis(force=False)
         bid, ask, mid, long_price, short_price, place_long, place_short, analysis = self.compute_offset_entry_prices(analysis)
 
         if mid <= LOWER_PRICE or mid >= UPPER_PRICE:
@@ -1171,44 +1196,14 @@ class OneShotNetGridCycle:
         log(msg, telegram=notify)
         return placed_long + placed_short > 0
 
-    def adopt_existing_position_if_any(self) -> bool:
-        """Take control of an already-open position after deploy/restart without closing it."""
-        stats = self.estimated_net_pnl()
-        if stats.get("position_amount", Decimal("0")) <= 0:
-            return False
-
-        self.entry_filled = True
-        self.active_side = str(stats.get("active_side", "UNKNOWN"))
-        self.best_net = max(self.best_net, stats.get("net", Decimal("0")))
-        self.best_exchange_upnl = max(self.best_exchange_upnl, stats.get("exchange_unrealized", Decimal("0")))
-
-        msg = (
-            f"🤝 ADOPT EXISTING POSITION — бот прийняв відкриту позицію під нову логіку\n"
-            f"{SYMBOL} {self.active_side} @ {stats.get('active_entry_price')} qty {stats.get('position_amount')}\n"
-            f"Net est зараз: {stats.get('net'):+.4f} | exchange uPnL: {stats.get('exchange_unrealized'):+.4f}\n"
-            f"bid/ask: {stats.get('bid')} / {stats.get('ask')} | spread: {stats.get('spread')}\n"
-            f"Нові параметри: Take Net +{TAKE_NET_PROFIT}, Take uPnL +{TAKE_EXCHANGE_UPNL} guard {EXCHANGE_TAKE_MIN_NET}, Stop {MAX_CYCLE_LOSS}"
-        )
-        log(msg, telegram=True)
-
-        # Recreate TP limit under current Railway variables after old orders were cancelled on startup.
-        self.place_native_tp_limit(stats)
-        return True
-
     def start(self) -> bool:
-        # Safe restart/adoption: if code was redeployed while a position/order exists,
-        # do not open a new entry. Manage the existing live position with current variables.
-        if ADOPT_EXISTING_POSITION_ON_START and self.adopt_existing_position_if_any():
-            log(f"💵 Wallet на старті adopted-циклу: {self.start_wallet:.4f} USDT")
-            return True
-
         analysis = self.wait_for_stable_signal()
         bid, ask, mid, long_price, short_price, place_long, place_short, analysis = self.compute_offset_entry_prices(analysis)
         if mid <= LOWER_PRICE or mid >= UPPER_PRICE:
             log(f"🟡 Ціна {mid} поза діапазоном {LOWER_PRICE}-{UPPER_PRICE}")
             return False
         if analysis.get("danger") or analysis.get("bias") == "SKIP":
-            log(f"🟡 Вхід пропущено: {analysis_short_text(analysis)}", telegram=True)
+            log(f"🟡 Вхід пропущено: {analysis_short_text(analysis)}")
             return False
 
         active_orders = Decimal((1 if place_long else 0) + (1 if place_short else 0))
@@ -1216,19 +1211,16 @@ class OneShotNetGridCycle:
         max_active_margin = max_active_notional / Decimal(LEVERAGE) if LEVERAGE else Decimal("0")
 
         header = (
-            f"🟢 SMART ADAPTIVE SCALP CYCLE #{self.cycle_number}\n"
-            f"{SYMBOL} bid/ask/mid: {bid} / {ask} / {mid}\n"
-            f"Virtual range: {LOWER_PRICE} - {UPPER_PRICE} | virtual step {VIRTUAL_GRID_STEP}\n"
-            f"Mode: {analysis.get('mode')} | Bias: {analysis.get('bias')} | Score: {analysis.get('score')}\n"
-            f"Analysis: {analysis.get('reason')}\n"
-            f"Signal confirmation: {SIGNAL_CONFIRM_SECONDS}s | refresh: {ANALYSIS_REFRESH_SECONDS}s\n"
-            f"Initial BUY LONG price: {long_price if place_long else 'disabled'}\n"
-            f"Initial SELL SHORT price: {short_price if place_short else 'disabled'}\n"
-            f"Orders: adaptive smart, then reprice until fill\n"
-            f"Notional per entry: {ORDER_NOTIONAL_USDT} USDT\n"
-            f"Max active margin ≈ {max_active_margin:.2f} USDT\n"
-            f"Take Net est: +{TAKE_NET_PROFIT} USDT | Stop Net est: {MAX_CYCLE_LOSS} USDT\n"
-            f"TP limit: {'on' if USE_TP_LIMIT_ORDER else 'off'} | Hybrid uPnL take: +{TAKE_EXCHANGE_UPNL} with net guard {EXCHANGE_TAKE_MIN_NET}"
+            f"🟢 ЦИКЛ #{self.cycle_number}: ПІДГОТОВКА ВХОДУ\n"
+            f"Пара: {SYMBOL} | Режим: {trade_mode_label()}\n"
+            f"Ринок: {mode_ua(analysis.get('mode'))} | score {analysis.get('score')}\n"
+            f"Ціна зараз: bid {bid} / ask {ask}\n"
+            f"План ордерів:\n"
+            f"• LONG: {long_price if place_long else 'вимкнено'}\n"
+            f"• SHORT: {short_price if place_short else 'вимкнено'}\n"
+            f"Розмір входу: {ORDER_NOTIONAL_USDT} USDT номінал ≈ {max_active_margin:.2f} USDT маржі при {LEVERAGE}x\n"
+            f"Цілі: TP Net +{TAKE_NET_PROFIT} USDT | SL {MAX_CYCLE_LOSS} USDT\n"
+            f"TP-ордер на біржі: {'так' if USE_TP_LIMIT_ORDER else 'ні'}"
         )
         log("\n" + "=" * 68)
         log(header, telegram=True)
@@ -1247,7 +1239,7 @@ class OneShotNetGridCycle:
             return False
 
         try:
-            analysis = self.get_market_analysis(force=True)
+            analysis = self.get_market_analysis(force=False)
             if not self.signal_is_confirmed(analysis):
                 return False
             bid, ask, mid, new_long, new_short, place_long, place_short, analysis = self.compute_offset_entry_prices(analysis)
@@ -1326,7 +1318,19 @@ class OneShotNetGridCycle:
         return Decimal('0')
 
     def place_native_tp_limit(self, stats: Dict[str, Decimal]) -> None:
+        """Place native TP once, then pause/retry according to TP_LIMIT_* settings.
+
+        Binance can reject reduce-only/close orders when the position or another close order is
+        not fully synchronized yet. The old version retried every loop and spammed Telegram/API.
+        This version attempts once, then waits TP_LIMIT_RETRY_SECONDS; by default max attempts = 1.
+        """
         if not USE_TP_LIMIT_ORDER or self.tp_order_placed:
+            return
+
+        now = time.monotonic()
+        if self.tp_limit_attempts >= TP_LIMIT_MAX_ATTEMPTS:
+            return
+        if now < self.tp_next_retry_at:
             return
 
         side_type = str(stats.get("active_side", "NONE"))
@@ -1340,16 +1344,46 @@ class OneShotNetGridCycle:
         if tp_price <= 0:
             return
 
+        self.tp_limit_attempts += 1
+        self.tp_next_retry_at = now + TP_LIMIT_RETRY_SECONDS
         cid = self.client_id("T", side_type, 99)
+
         try:
             place_close_limit_order(side_type, tp_price, qty, cid)
             self.tp_order_placed = True
             log(
-                f"🎯 TP LIMIT placed for {side_type}: price {tp_price} qty {qty} | target Net est +{TAKE_NET_PROFIT}",
+                f"🎯 TP-ОРДЕР ВИСТАВЛЕНО\n"
+                f"Пара: {SYMBOL}\n"
+                f"Позиція: {side_ua(side_type)}\n"
+                f"Ціна TP: {tp_price}\n"
+                f"Кількість: {qty}\n"
+                f"Ціль: приблизно +{TAKE_NET_PROFIT} USDT чистими",
                 telegram=True,
             )
         except Exception as error:
-            log(f"⚠️ Не зміг поставити TP LIMIT: {error}", telegram=True)
+            self.tp_last_error = str(error)
+            attempts_left = max(TP_LIMIT_MAX_ATTEMPTS - self.tp_limit_attempts, 0)
+            if attempts_left > 0:
+                log(
+                    f"⚠️ TP-ордер не прийнято біржею\n"
+                    f"Пара: {SYMBOL}\n"
+                    f"Позиція: {side_ua(side_type)}\n"
+                    f"Спроба: {self.tp_limit_attempts}/{TP_LIMIT_MAX_ATTEMPTS}\n"
+                    f"Наступна спроба через: {TP_LIMIT_RETRY_SECONDS} сек\n"
+                    f"Помилка: {error}",
+                    telegram=True,
+                )
+            else:
+                log(
+                    f"⚠️ TP-ордер не поставлено\n"
+                    f"Пара: {SYMBOL}\n"
+                    f"Позиція: {side_ua(side_type)}\n"
+                    f"Спроба: {self.tp_limit_attempts}/{TP_LIMIT_MAX_ATTEMPTS}\n"
+                    f"Повторів більше не буде, щоб не спамити API.\n"
+                    f"Позицію контролюю по Net est / Binance PnL.\n"
+                    f"Помилка: {error}",
+                    telegram=True,
+                )
 
     def update_fills(self) -> None:
         exchange_orders = fetch_recent_orders()
@@ -1380,15 +1414,26 @@ class OneShotNetGridCycle:
 
                 self.entry_filled = True
                 self.active_side = side_type
-                log(f"✅ {side_type} ENTRY filled @ {price} qty {qty}", telegram=True)
+                notional = price * qty
+                margin_est = notional / Decimal(LEVERAGE) if LEVERAGE else Decimal("0")
+                log(
+                    f"✅ ПОЗИЦІЮ ВІДКРИТО\n"
+                    f"Пара: {SYMBOL}\n"
+                    f"Напрямок: {side_ua(side_type)}\n"
+                    f"Вхід: {price}\n"
+                    f"Кількість: {qty}\n"
+                    f"Номінал: ≈ {plain_money(notional, 2)} USDT\n"
+                    f"Маржа: ≈ {plain_money(margin_est, 2)} USDT при {LEVERAGE}x",
+                    telegram=True,
+                )
 
                 # One-shot: after first entry, remove the opposite entry.
                 # No TP order. Bot exits only by Net est target/stop.
                 cancel_all_orders()
                 time.sleep(0.2)
 
-    def mark_entry_from_stats(self, stats: Dict[str, Decimal]) -> None:
-        """Detect entry via live position instead of slow allOrders polling."""
+    def mark_entry_from_stats(self, stats: Dict[str, Decimal], adopted: bool = False) -> None:
+        """Detect/adopt entry via live position instead of slow allOrders polling."""
         if self.entry_filled:
             return
         if stats.get("position_amount", Decimal("0")) <= 0:
@@ -1398,7 +1443,20 @@ class OneShotNetGridCycle:
         self.active_side = str(stats.get("active_side", "UNKNOWN"))
         price = stats.get("active_entry_price", Decimal("0"))
         qty = stats.get("position_amount", Decimal("0"))
-        log(f"✅ {self.active_side} ENTRY detected @ {price} qty {qty}", telegram=True)
+        notional = price * qty
+        margin_est = notional / Decimal(LEVERAGE) if LEVERAGE else Decimal("0")
+        title = "🤝 ПРИЙНЯТО ВІДКРИТУ ПОЗИЦІЮ" if adopted else "✅ ПОЗИЦІЮ ВІДКРИТО"
+        log(
+            f"{title}\n"
+            f"Пара: {SYMBOL}\n"
+            f"Напрямок: {side_ua(self.active_side)}\n"
+            f"Вхід: {price}\n"
+            f"Кількість: {qty}\n"
+            f"Номінал: ≈ {plain_money(notional, 2)} USDT\n"
+            f"Маржа: ≈ {plain_money(margin_est, 2)} USDT при {LEVERAGE}x\n"
+            f"TP Net: +{TAKE_NET_PROFIT} USDT | SL: {MAX_CYCLE_LOSS} USDT",
+            telegram=True,
+        )
 
         # One-shot: after first live position appears, remove opposite entry as fast as possible.
         try:
@@ -1511,7 +1569,7 @@ class OneShotNetGridCycle:
         }
 
 
-def finish_cycle_already_closed(cycle: OneShotNetGridCycle, started_at: float, reason: str = "🎯 POSITION CLOSED / TP LIMIT FILLED") -> str:
+def finish_cycle_already_closed(cycle: OneShotNetGridCycle, started_at: float, reason: str = "TP LIMIT / POSITION CLOSED") -> str:
     try:
         cancel_all_orders()
     except Exception as error:
@@ -1520,50 +1578,18 @@ def finish_cycle_already_closed(cycle: OneShotNetGridCycle, started_at: float, r
     final_wallet = get_usdt_wallet_balance()
     actual = final_wallet - cycle.start_wallet
     result = "TARGET" if actual >= 0 else "STOP"
+    symbol = "✅" if actual >= 0 else "❌"
     msg = (
-        f"✅ {reason}\n"
-        f"Фактичний результат циклу: {actual:+.4f} USDT\n"
-        f"Best Net est seen: {cycle.best_net:+.4f} USDT\n"
-        f"Best exchange uPnL seen: {cycle.best_exchange_upnl:+.4f} USDT\n"
-        f"⏱️ Час виконання гріда: {format_duration(time.monotonic() - started_at)}"
+        f"{symbol} ПОЗИЦІЮ ЗАКРИТО\n"
+        f"Причина: {reason}\n"
+        f"Пара: {SYMBOL}\n"
+        f"Результат циклу: {money(actual)} USDT\n"
+        f"Найкращий Net est: {money(cycle.best_net)} USDT\n"
+        f"Найкращий Binance PnL: {money(cycle.best_exchange_upnl)} USDT\n"
+        f"Час у позиції/циклі: {format_duration(time.monotonic() - started_at)}"
     )
     log(msg, telegram=True)
     return result
-
-def spread_pct_from_stats(stats: Dict[str, Decimal]) -> Decimal:
-    mid = stats.get("mid", Decimal("0"))
-    spread = stats.get("spread", Decimal("0"))
-    if mid <= 0:
-        return Decimal("0")
-    return spread / mid
-
-
-def should_delay_market_stop_due_to_spread(stats: Dict[str, Decimal]) -> bool:
-    if not AVOID_MARKET_CLOSE_ON_WIDE_SPREAD:
-        return False
-    spread_pct = spread_pct_from_stats(stats)
-    if spread_pct <= MAX_EXIT_SPREAD_PCT:
-        return False
-    # If Binance/mark PnL is already catastrophically bad, do not hide behind spread guard.
-    if stats.get("exchange_unrealized", Decimal("0")) <= HARD_STOP_EXCHANGE_UPNL:
-        return False
-    return True
-
-
-def notify_spread_guard_if_needed(cycle: OneShotNetGridCycle, stats: Dict[str, Decimal]) -> None:
-    now = time.monotonic()
-    if now - cycle.last_spread_guard_notify_at < SPREAD_GUARD_NOTIFY_EVERY_SECONDS:
-        return
-    cycle.last_spread_guard_notify_at = now
-    spread_pct = spread_pct_from_stats(stats) * Decimal("100")
-    log(
-        f"🟡 STOP затримано через широкий spread\n"
-        f"Net est: {stats['net']:+.4f} <= Stop {MAX_CYCLE_LOSS}, але spread {spread_pct:.4f}% > max {MAX_EXIT_SPREAD_PCT * Decimal('100'):.4f}%\n"
-        f"exchange uPnL: {stats['exchange_unrealized']:+.4f} | hard stop: {HARD_STOP_EXCHANGE_UPNL}\n"
-        f"Позицію не закриваю MARKET у поганий spread. Чекаю звуження spread або реального погіршення.",
-        telegram=True,
-    )
-
 
 def close_cycle(cycle: OneShotNetGridCycle, filters: Dict[str, Decimal], reason: str, stats: Dict[str, Decimal], started_at: float, is_stop: bool) -> str:
     # LOW LATENCY IMPORTANT:
@@ -1594,25 +1620,26 @@ def close_cycle(cycle: OneShotNetGridCycle, filters: Dict[str, Decimal], reason:
 
     final_wallet = get_usdt_wallet_balance()
     actual = final_wallet - cycle.start_wallet
-    symbol = "❌" if is_stop else "✅"
+    symbol = "❌" if is_stop or actual < 0 else "✅"
+    verdict = "СТОП" if is_stop else "ТЕЙК"
 
     msg = (
-        f"{symbol} {reason}\n"
-        f"Trigger Net est: {stats['net']:+.4f} USDT\n"
-        f"Entry: {stats['active_side']} @ {stats['active_entry_price']} qty {stats['position_amount']}\n"
-        f"exec PnL at trigger: {stats['unrealized']:+.4f}\n"
-        f"exchange uPnL at trigger: {stats['exchange_unrealized']:+.4f}\n"
-        f"bid/ask at trigger: {stats.get('bid', Decimal('0'))} / {stats.get('ask', Decimal('0'))}\n"
-        f"close price used: {stats.get('close_price', Decimal('0'))}\n"
-        f"Best Net est seen: {cycle.best_net:+.4f}\n"
-        f"Best exchange uPnL seen: {cycle.best_exchange_upnl:+.4f}\n"
-        f"entry fee est: {stats['entry_fee_est']:.4f}\n"
-        f"exit fee est: {stats['exit_fee_est']:.4f}\n"
-        f"Фактичний результат циклу: {actual:+.4f} USDT\n"
-        f"⏱️ Час виконання гріда: {format_duration(time.monotonic() - started_at)}"
+        f"{symbol} ПОЗИЦІЮ ЗАКРИТО — {verdict}\n"
+        f"Пара: {SYMBOL}\n"
+        f"Напрямок: {side_ua(stats['active_side'])}\n"
+        f"Вхід: {stats['active_entry_price']}\n"
+        f"Ціна закриття/розрахунку: {stats.get('close_price', Decimal('0'))}\n"
+        f"Кількість: {stats['position_amount']}\n"
+        f"Результат фактичний: {money(actual)} USDT\n"
+        f"Net est при тригері: {money(stats['net'])} USDT\n"
+        f"Binance PnL при тригері: {money(stats['exchange_unrealized'])} USDT\n"
+        f"Комісії оцінка: {plain_money(stats['entry_fee_est'], 4)} + {plain_money(stats['exit_fee_est'], 4)} USDT\n"
+        f"Best Net / Best PnL: {money(cycle.best_net)} / {money(cycle.best_exchange_upnl)} USDT\n"
+        f"Час у циклі: {format_duration(time.monotonic() - started_at)}\n"
+        f"Причина: {reason}"
     )
     if close_error:
-        msg += f"\n⚠️ Close warning: {close_error}"
+        msg += f"\n⚠️ Попередження по закриттю: {close_error}"
     log(msg, telegram=True)
     return "STOP" if is_stop else "TARGET"
 
@@ -1621,8 +1648,12 @@ def run_cycle(cycle_number: int, filters: Dict[str, Decimal], taker_fee: Decimal
     cycle = OneShotNetGridCycle(cycle_number, filters, taker_fee)
     cycle_started_at = time.monotonic()
 
-    if not cycle.start():
-        return "OUTSIDE"
+    initial_stats = cycle.estimated_net_pnl()
+    if initial_stats.get("position_amount", Decimal("0")) > 0:
+        cycle.mark_entry_from_stats(initial_stats, adopted=True)
+    else:
+        if not cycle.start():
+            return "OUTSIDE"
 
     last_print = 0.0
     last_status_tg = 0.0
@@ -1655,7 +1686,7 @@ def run_cycle(cycle_number: int, filters: Dict[str, Decimal], taker_fee: Decimal
 
         # Fast close decision BEFORE printing/Telegram.
         if cycle.entry_filled and stats["net"] >= TAKE_NET_PROFIT:
-            return close_cycle(cycle, filters, "💰 TAKE ПО NET EST ДОСЯГНУТО", stats, cycle_started_at, is_stop=False)
+            return close_cycle(cycle, filters, "TP по Net est", stats, cycle_started_at, is_stop=False)
 
         if (
             cycle.entry_filled
@@ -1666,24 +1697,21 @@ def run_cycle(cycle_number: int, filters: Dict[str, Decimal], taker_fee: Decimal
             return close_cycle(
                 cycle,
                 filters,
-                "💰 TAKE ПО BINANCE UPNL + NET GUARD ДОСЯГНУТО",
+                "TP по Binance PnL + Net guard",
                 stats,
                 cycle_started_at,
                 is_stop=False,
             )
 
         if cycle.entry_filled and stats["net"] <= MAX_CYCLE_LOSS:
-            if should_delay_market_stop_due_to_spread(stats):
-                notify_spread_guard_if_needed(cycle, stats)
-            else:
-                return close_cycle(cycle, filters, "🛑 STOP ПО NET EST ДОСЯГНУТО", stats, cycle_started_at, is_stop=True)
+            return close_cycle(cycle, filters, "Stop по Net est", stats, cycle_started_at, is_stop=True)
 
         if now >= session_end and not waiting_after_session_end:
             if cycle.entry_filled or has_open_position():
-                log("⏰ 4 години минули. Нові цикли не запускаю, чекаю закриття поточної позиції по Net est target/stop.", telegram=True)
+                log("⏰ Час сесії минув. Нові цикли не запускаю, чекаю закриття поточної позиції по TP/SL.", telegram=True)
                 waiting_after_session_end = True
             else:
-                log("⏰ 4 години минули. Входу ще не було — скасовую entry-ордери і завершую тест.", telegram=True)
+                log("⏰ Час сесії минув. Входу ще не було — скасовую entry-ордери і завершую сесію.", telegram=True)
                 cancel_all_orders()
                 time.sleep(0.5)
                 return "TIME"
@@ -1706,15 +1734,22 @@ def run_cycle(cycle_number: int, filters: Dict[str, Decimal], taker_fee: Decimal
             log(line)
             last_print = now
 
-        if cycle.entry_filled and now - last_status_tg >= TELEGRAM_STATUS_EVERY_SECONDS:
+        if (
+            cycle.entry_filled
+            and TELEGRAM_STATUS_EVERY_SECONDS > 0
+            and now - last_status_tg >= TELEGRAM_STATUS_EVERY_SECONDS
+        ):
             tg_send(
-                f"📊 {SYMBOL} Cycle #{cycle_number}\n"
-                f"Time: {format_duration(now - cycle_started_at)}\n"
-                f"Entry: {stats['active_side']} @ {stats['active_entry_price']} qty {stats['position_amount']}\n"
-                f"Net est: {stats['net']:+.4f} USDT\n"
-                f"exchange uPnL: {stats['exchange_unrealized']:+.4f} USDT\n"
-                f"Best Net: {cycle.best_net:+.4f} | Best uPnL: {cycle.best_exchange_upnl:+.4f}\n"
-                f"Take Net: +{TAKE_NET_PROFIT} | Take uPnL: +{TAKE_EXCHANGE_UPNL} with guard {EXCHANGE_TAKE_MIN_NET} | Stop: {MAX_CYCLE_LOSS}"
+                f"📍 СТАТУС ПОЗИЦІЇ #{cycle_number}\n"
+                f"Пара: {SYMBOL}\n"
+                f"Напрямок: {side_ua(stats['active_side'])}\n"
+                f"Вхід: {stats['active_entry_price']} | qty {stats['position_amount']}\n"
+                f"Net est: {money(stats['net'])} USDT\n"
+                f"Binance PnL: {money(stats['exchange_unrealized'])} USDT\n"
+                f"Best Net / Best PnL: {money(cycle.best_net)} / {money(cycle.best_exchange_upnl)} USDT\n"
+                f"Bid/Ask: {stats['bid']} / {stats['ask']} | spread {stats['spread']}\n"
+                f"Час: {format_duration(now - cycle_started_at)}\n"
+                f"TP: +{TAKE_NET_PROFIT} | SL: {MAX_CYCLE_LOSS}"
             )
             last_status_tg = now
 
@@ -1726,30 +1761,21 @@ def run_cycle(cycle_number: int, filters: Dict[str, Decimal], taker_fee: Decimal
 # ============================================================
 
 def main() -> None:
+    global _LAST_CYCLE_ERROR_ALERT_AT
     require_env()
 
     banner = (
-        f"🤖 {SYMBOL} SMART ADAPTIVE SCALP BOT v6.2 SAFE RESTART\n"
-        f"Time: {now_utc()}\n"
-        f"Base URL: {BASE_URL}\n"
-        f"Range: {LOWER_PRICE} - {UPPER_PRICE} | Grid: {GRID_COUNT}\n"
-        f"Budget: {MARGIN_BUDGET_USDT} USDT | Leverage: {LEVERAGE}x\n"
-        f"Order notional: {ORDER_NOTIONAL_USDT} USDT\n"
-        f"Entry offset: {(ENTRY_OFFSET_PCT * Decimal('100')):.4f}% from bid/ask\n"
-        f"Virtual range/grid: {LOWER_PRICE}-{UPPER_PRICE}, step {VIRTUAL_GRID_STEP}\n"
-        f"Smart analysis: {'on' if USE_SMART_ANALYSIS else 'off'} | confirm {SIGNAL_CONFIRM_SECONDS}s | refresh {ANALYSIS_REFRESH_SECONDS}s\n"
-        f"Bias thresholds: {BIAS_THRESHOLD}/{STRONG_BIAS_THRESHOLD} | counter offset {(COUNTER_BIAS_OFFSET_PCT * Decimal('100')):.4f}%\n"
-        f"Adaptive reprice: every {REPRICE_ENTRY_SECONDS}s, min move {(REPRICE_MIN_MOVE_PCT * Decimal('100')):.4f}%\n"
-        f"TAKE Net est: +{TAKE_NET_PROFIT} USDT\n"
-        f"TAKE exchange uPnL: +{TAKE_EXCHANGE_UPNL} USDT with Net guard {EXCHANGE_TAKE_MIN_NET}\n"
-        f"Native TP limit: {'on' if USE_TP_LIMIT_ORDER else 'off'}\n"
-        f"STOP Net est: {MAX_CYCLE_LOSS} USDT\n"
-        f"Runtime: {format_duration(TOTAL_RUNTIME_SECONDS)}\n"
-        f"Fast check: every {CHECK_INTERVAL_SECONDS}s | Print every {PRINT_INTERVAL_SECONDS}s\n"
-        f"Live wallet in loop: {'on' if LIVE_WALLET_IN_LOOP else 'off'}\n"
-        f"Startup adoption: {'on' if ADOPT_EXISTING_POSITION_ON_START else 'off'} | cancel stale orders: {'on' if CANCEL_STALE_ORDERS_ON_START else 'off'}\n"
-        f"Exit spread guard: {'on' if AVOID_MARKET_CLOSE_ON_WIDE_SPREAD else 'off'} | max exit spread {(MAX_EXIT_SPREAD_PCT * Decimal('100')):.4f}% | hard uPnL {HARD_STOP_EXCHANGE_UPNL}\n"
-        f"Railway-ready: yes | Telegram: {'on' if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID else 'off'}"
+        f"🤖 БОТ ЗАПУЩЕНО — v6.1.2 LIVE SAFE 24/7\n"
+        f"Режим: {trade_mode_label()} | Пара: {SYMBOL}\n"
+        f"Час: {now_utc()}\n"
+        f"Діапазон: {LOWER_PRICE} - {UPPER_PRICE}\n"
+        f"Розмір входу: {ORDER_NOTIONAL_USDT} USDT номінал | плече {LEVERAGE}x\n"
+        f"TP Net: +{TAKE_NET_PROFIT} USDT | SL: {MAX_CYCLE_LOSS} USDT\n"
+        f"TP по Binance PnL: +{TAKE_EXCHANGE_UPNL} з Net guard {EXCHANGE_TAKE_MIN_NET}\n"
+        f"TP-ордер на біржі: {'так' if USE_TP_LIMIT_ORDER else 'ні'}\n"
+        f"Аналіз: {'увімкнено' if USE_SMART_ANALYSIS else 'вимкнено'} | підтвердження {SIGNAL_CONFIRM_SECONDS}s\n"
+        f"Час роботи: {'24/7' if TOTAL_RUNTIME_SECONDS <= 0 else format_duration(TOTAL_RUNTIME_SECONDS)}\n"
+        f"Telegram status: {'вимкнено' if TELEGRAM_STATUS_EVERY_SECONDS <= 0 else 'кожні ' + str(TELEGRAM_STATUS_EVERY_SECONDS) + 's'}"
     )
     log("\n" + "=" * 68)
     log(banner, telegram=True)
@@ -1758,29 +1784,38 @@ def main() -> None:
     sync_binance_time()
     filters = get_symbol_filters()
 
+    if CLOSE_ON_START:
+        log("🧹 Старт: скасовую старі ордери і закриваю старі позиції...")
+        cleanup(filters, close_positions=True)
+    else:
+        log("🧹 Старт: скасовую тільки старі ордери, позиції не чіпаю...")
+        cleanup(filters, close_positions=False)
+
     ensure_hedge_mode()
     set_isolated()
     set_leverage()
 
-    # v6.2 safe restart: do not destroy an existing position on redeploy.
-    # Old orders are reconciled and position is adopted under current Railway Variables.
-    startup_reconcile(filters)
-
     taker_fee = get_taker_fee()
-    log(f"⚙️ Taker fee: {(taker_fee * Decimal('100')):.4f}%", telegram=True)
+    log(f"⚙️ Taker fee: {(taker_fee * Decimal('100')):.4f}%")
 
     session_start_wallet = get_usdt_wallet_balance()
     session_start = time.monotonic()
-    session_end = session_start + TOTAL_RUNTIME_SECONDS
+    session_end = float("inf") if TOTAL_RUNTIME_SECONDS <= 0 else session_start + TOTAL_RUNTIME_SECONDS
     cycle_number = 1
 
     try:
-        while time.monotonic() < session_end:
+        while True:
+            if time.monotonic() >= session_end:
+                break
             try:
                 result = run_cycle(cycle_number, filters, taker_fee, session_end)
             except Exception as error:
                 # Last defense: do not kill Railway process on one unexpected error.
-                log(f"🚨 Помилка циклу: {type(error).__name__}: {error}\nЧекаю {API_RETRY_SLEEP_SECONDS} сек і продовжую контроль.", telegram=True)
+                now_err = time.monotonic()
+                msg = f"🚨 Помилка циклу: {type(error).__name__}: {error}\nПауза {API_RETRY_SLEEP_SECONDS} сек і продовжую контроль."
+                log(msg, telegram=(now_err - _LAST_CYCLE_ERROR_ALERT_AT >= API_DOWNTIME_NOTIFY_EVERY_SECONDS))
+                if now_err - _LAST_CYCLE_ERROR_ALERT_AT >= API_DOWNTIME_NOTIFY_EVERY_SECONDS:
+                    _LAST_CYCLE_ERROR_ALERT_AT = now_err
                 time.sleep(API_RETRY_SLEEP_SECONDS)
                 continue
 
@@ -1798,15 +1833,15 @@ def main() -> None:
                     break
 
                 pause_seconds = COOLDOWN_SECONDS if result == "TARGET" else LOSS_COOLDOWN_SECONDS
-                log(f"☕ Пауза {pause_seconds} секунд...", telegram=True)
-                time.sleep(min(pause_seconds, remaining))
+                log(f"☕ Пауза {pause_seconds} секунд...")
+                time.sleep(pause_seconds if session_end == float("inf") else min(pause_seconds, remaining))
                 cycle_number += 1
 
     except KeyboardInterrupt:
         log("🛑 Тест зупинено вручну.", telegram=True)
 
     finally:
-        log("\n🧹 Завершення тесту: скасовую ордери...", telegram=True)
+        log("\n🧹 Завершення тесту: скасовую ордери...")
         try:
             cleanup(filters, close_positions=CLOSE_ON_EXIT)
         except Exception as error:
@@ -1817,12 +1852,14 @@ def main() -> None:
         elapsed_min = (time.monotonic() - session_start) / 60
 
         summary = (
-            "📊 ПІДСУМОК ТЕСТУ\n"
-            f"Час: {elapsed_min:.1f} хв\n"
+            "📊 ПІДСУМОК СЕСІЇ\n"
+            f"Пара: {SYMBOL}\n"
+            f"Режим: {trade_mode_label()}\n"
+            f"Час роботи: {elapsed_min:.1f} хв\n"
             f"Циклів: {cycle_number}\n"
             f"Стартовий баланс: {session_start_wallet:.4f} USDT\n"
             f"Фінальний баланс: {final_wallet:.4f} USDT\n"
-            f"Результат: {total_result:+.4f} USDT"
+            f"Загальний результат: {money(total_result)} USDT"
         )
         log("\n" + "=" * 68)
         log(summary, telegram=True)
