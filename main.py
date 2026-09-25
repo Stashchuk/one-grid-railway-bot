@@ -458,7 +458,13 @@ def signed_request(
             raise RuntimeError(f"Binance API error {response.status_code}: {data}")
 
         _notify_network_restored()
-        return data
+        # Important: successful signed Binance endpoints may return either dict or list.
+        # _extract_binance_error() wraps list responses into {"data": [...]}, which is useful
+        # for rate-limit/error handling, but business logic needs the raw JSON list.
+        try:
+            return response.json()
+        except Exception:
+            return data
 
 
 def sync_binance_time() -> None:
@@ -518,11 +524,34 @@ def get_symbol_filters() -> Dict[str, Decimal]:
 
 
 def get_usdt_wallet_balance() -> Decimal:
-    data = signed_request("GET", "/fapi/v3/balance")
-    for item in data:
-        if item["asset"] == "USDT":
-            return Decimal(item["balance"])
-    return Decimal("0")
+    """Return USDT futures wallet balance.
+
+    Binance normally returns a list from /fapi/v3/balance. If an unexpected
+    shape appears, fall back to v2 and fail with a clear message instead of
+    crashing with TypeError.
+    """
+    last_data = None
+    for endpoint in ("/fapi/v3/balance", "/fapi/v2/balance"):
+        data = signed_request("GET", endpoint)
+        last_data = data
+
+        # Normal shape: [{"asset": "USDT", "balance": "..."}, ...]
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict) and item.get("asset") == "USDT":
+                    return Decimal(str(item.get("balance", "0")))
+
+        # Defensive support if some wrapper ever returns {"data": [...]}
+        if isinstance(data, dict) and isinstance(data.get("data"), list):
+            for item in data["data"]:
+                if isinstance(item, dict) and item.get("asset") == "USDT":
+                    return Decimal(str(item.get("balance", "0")))
+
+        # Binance API error payload with HTTP 200 or unexpected dict.
+        if isinstance(data, dict) and ("code" in data or "msg" in data):
+            raise RuntimeError(f"Не вдалося прочитати баланс USDT через {endpoint}: {data}")
+
+    raise RuntimeError(f"Неочікувана відповідь Binance balance endpoint: {last_data}")
 
 
 def get_book():
@@ -1765,7 +1794,7 @@ def main() -> None:
     require_env()
 
     banner = (
-        f"🤖 БОТ ЗАПУЩЕНО — v6.1.2 LIVE SAFE 24/7\n"
+        f"🤖 БОТ ЗАПУЩЕНО — v6.1.3 LIVE SAFE 24/7\n"
         f"Режим: {trade_mode_label()} | Пара: {SYMBOL}\n"
         f"Час: {now_utc()}\n"
         f"Діапазон: {LOWER_PRICE} - {UPPER_PRICE}\n"
